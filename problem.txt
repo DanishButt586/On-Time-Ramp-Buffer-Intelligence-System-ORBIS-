@@ -1,3 +1,4 @@
-air crafts complete ni h. 787 dreamline ,airbus 330. 747, 777. 
-GHA(ground handling agent) bhi add krna ha. GSE ke liye zrori ha. 
-GSE equipment kam han bht. 
+-- Loadsheet add krni ha as a seperate module
+-- Performance of every equipment --> Sir Ramzan
+-- AVGDS --> Sir Ramzan
+-- Evaluation table kis base pr equipment ki evaluation ho rhi ha

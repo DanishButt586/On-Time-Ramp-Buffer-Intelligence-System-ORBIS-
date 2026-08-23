@@ -35,7 +35,7 @@ const ROLES = {
 
 const STATUSES = { PENDING: 'Pending', APPROVED: 'Approved', REJECTED: 'Rejected', SUSPENDED: 'Suspended' };
 
-/* SVG path bodies for the eight ORBIS modules */
+/* SVG path bodies for the ORBIS modules */
 const ICONS = {
   flightboard: '<path d="M12 2 L14.5 9.5 L22 12 L14.5 14.5 L12 22 L9.5 14.5 L2 12 L9.5 9.5 Z"/>',
   turnaround: '<path d="M21 12 a9 9 0 1 1-3-6.7"/><path d="M21 4 V9 H16"/>',
@@ -43,17 +43,21 @@ const ICONS = {
   offblock: '<circle cx="12" cy="12" r="9"/><path d="M12 7 V12 L15.5 14"/>',
   manager: '<path d="M4 20 V10 M10 20 V4 M16 20 V13 M22 20 H2"/>',
   equipment: '<path d="M12 2 v3 M12 19 v3 M2 12 h3 M19 12 h3"/><circle cx="12" cy="12" r="4"/><path d="M12 8 a4 4 0 0 1 4 4"/>',
+  gha: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M9 8 h1.5 M13.5 8 h1.5 M9 12 h1.5 M13.5 12 h1.5 M9 16 h1.5 M13.5 16 h1.5"/>',
   weights: '<path d="M12 3 v18 M6 7 h12 M4 21 h16"/><path d="M6 7 L3 13 a3 3 0 0 0 6 0 Z"/><path d="M18 7 L15 13 a3 3 0 0 0 6 0 Z"/>',
-  analytics: '<path d="M3 3 v18 h18"/><path d="M7 15 L11 10 L14 13 L20 6"/>'
+  analytics: '<path d="M3 3 v18 h18"/><path d="M7 15 L11 10 L14 13 L20 6"/>',
+  loadsheet: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 8 h10 M7 12 h10 M7 16 h6"/><circle cx="17.5" cy="16.5" r="1.6"/>'
 };
 
 const MODULES = {
   flightboard: { label: 'Flight Board', locked: true },
   turnaround: { label: 'Turnaround Detail', locked: false },
   gse: { label: 'GSE Entry', locked: false },
-  offblock: { label: 'Off-Block Logging', locked: false },
+  offblock: { label: 'Block Times', locked: false },
+  loadsheet: { label: 'Loadsheet', locked: false },
   manager: { label: 'Manager Dashboard', locked: false },
   equipment: { label: 'Equipment Register', locked: false },
+  gha: { label: 'GHA Management', locked: false },
   weights: { label: 'Weights & Thresholds', locked: false },
   analytics: { label: 'Accuracy Analytics', locked: false }
 };
@@ -84,11 +88,11 @@ function updateUser(id, changes) {
 }
 
 function getActivity() { const a = readJSON(ACTIVITY_KEY, []); return Array.isArray(a) ? a : []; }
-function logActivity({ action, target, category = 'user', severity = 'info' }) {
+function logActivity({ action, target, category = 'user', severity = 'info', actor }) {
   const session = getSession();
   const entry = {
     id: uid('a'), timestamp: new Date().toISOString(),
-    actor: session ? session.name : 'System', action, target: target || '—', category, severity
+    actor: actor || (session ? session.name : 'System'), action, target: target || '—', category, severity
   };
   const all = getActivity(); all.unshift(entry);
   localStorage.setItem(ACTIVITY_KEY, JSON.stringify(all.slice(0, 200)));
@@ -151,6 +155,25 @@ function seedIfEmpty() {
     })
   ];
   saveUsers(users);
+}
+
+/* a returning browser's admin/station-admin accounts were seeded before the
+   'gha' module existed, so their frozen permissions arrays never picked it
+   up automatically — backfill it for those two roles only, matching the
+   "granted to the admin + station admins by default" rule from a fresh seed */
+function migratePermissions() {
+  const users = getUsers();
+  let changed = false;
+  users.forEach(u => {
+    if ((u.role === 'SUPER_ADMIN' || u.role === 'STATION_ADMIN') && u.permissions && !u.permissions.includes('gha')) {
+      u.permissions.push('gha'); changed = true;
+    }
+    /* 'loadsheet' defaults to station admin + ramp supervisor roles */
+    if ((u.role === 'SUPER_ADMIN' || u.role === 'STATION_ADMIN' || u.role === 'SUPERVISOR') && u.permissions && !u.permissions.includes('loadsheet')) {
+      u.permissions.push('loadsheet'); changed = true;
+    }
+  });
+  if (changed) saveUsers(users);
 }
 
 /* ═══ (3) showView + toast + modal + confirm ════════════════ */
@@ -299,6 +322,13 @@ function countUp(el, target, dur = 600) {
   (function frame(now) {
     const p = Math.min((now - start) / dur, 1); el.textContent = String(Math.round(target * (1 - Math.pow(1 - p, 3))));
     if (p < 1) requestAnimationFrame(frame); else el.textContent = String(target);
+  })(performance.now());
+}
+function countUpMoney(el, target, dur = 600) {
+  if (!el) return; const start = performance.now();
+  (function frame(now) {
+    const p = Math.min((now - start) / dur, 1); el.textContent = fmtMoney(target * (1 - Math.pow(1 - p, 3)));
+    if (p < 1) requestAnimationFrame(frame); else el.textContent = fmtMoney(target);
   })(performance.now());
 }
 
@@ -727,7 +757,20 @@ const sessionMgr = (function () {
     showToast('Session expired — please sign in again', 'notice');
   }
 
-  function onActivity() { if (timer && readJSON(SESSION_KEY, null)) topUp(); }
+  /* Every click/keypress used to call topUp() unconditionally, which reset
+     the visible countdown straight back to 15:00 on literally any click —
+     it looked frozen/broken rather than a real countdown, since normal use
+     never lets a minute pass without a click somewhere. Only extending once
+     the session has genuinely aged (more than a minute since the last
+     extension) lets the countdown actually tick down during active use,
+     while still renewing well before it would ever expire on someone who's
+     truly still working. */
+  function onActivity() {
+    if (!timer) return;
+    const s = readJSON(SESSION_KEY, null); if (!s || !s.expiresAt) return;
+    const remaining = s.expiresAt - Date.now();
+    if (remaining < SESSION_MS - 60000) topUp();
+  }
 
   function start() {
     stop();
@@ -845,7 +888,7 @@ function renderUsers() {
       <td>${statusBadge(u.status)}</td>
       <td>${accessStripHtml(u)}</td>
       <td>${sessionCellHtml(u)}</td>
-      <td class="mono" style="font-size:11.5px;color:var(--text-mute)">${fmtDate(u.registeredAt)}</td>
+      <td class="mono" style="font-size:12px;color:var(--text-mute)">${fmtDate(u.registeredAt)}</td>
       <td class="th-act"><button class="kebab-btn" data-kebab="${u.id}" aria-label="Actions">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg></button></td>
     </tr>`;
@@ -1359,7 +1402,9 @@ function wireApp() { document.getElementById('app-signout').addEventListener('cl
 
 function init() {
   seedIfEmpty();
+  migratePermissions();
   seedOpsData();
+  seedLoadsheets();
   ambient.init();
   wireAuth(); wireMFA(); wireAdmin(); wireApp();
 
@@ -1525,6 +1570,12 @@ const OUTCOMES_KEY = 'orbis_outcomes';
 const WEIGHTS_KEY = 'orbis_weights';
 const RULES_KEY = 'orbis_action_rules';
 const INTEG_KEY = 'orbis_integration';
+const GHAS_KEY = 'orbis_ghas';
+const GHA_PERF_KEY = 'orbis_gha_performance';
+const GHA_PERF_CONFIG_KEY = 'orbis_gha_perf_config';
+const EQUIP_PERF_CONFIG_KEY = 'orbis_equipment_perf_config';
+const GHO_CERT_KEY = 'orbis_gho_certificates';
+const LOADSHEET_KEY = 'orbis_loadsheets';
 
 function lsGet(key, fb) { const v = readJSON(key, fb); return v == null ? fb : v; }
 function lsSet(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
@@ -1551,8 +1602,65 @@ function getActionRules() { return lsGet(RULES_KEY, {}); }
 function getIntegration() { return lsGet(INTEG_KEY, { weather: 'HEALTHY', dcs: 'HEALTHY' }); }
 function saveIntegration(i) { lsSet(INTEG_KEY, i); }
 
+function getGhas() { const g = lsGet(GHAS_KEY, []); return Array.isArray(g) ? g : []; }
+function saveGhas(g) { lsSet(GHAS_KEY, g); }
+function getGha(id) { return getGhas().find(g => g.id === id) || null; }
+
+/* GHA performance — monthly snapshots (append/upsert, not versioned) */
+function getGhaPerfRecords() { const r = lsGet(GHA_PERF_KEY, []); return Array.isArray(r) ? r : []; }
+function saveGhaPerfRecords(r) { lsSet(GHA_PERF_KEY, r); }
+function getGhaPerfRecord(ghaId, period) { return getGhaPerfRecords().find(r => r.ghaId === ghaId && r.period === period) || null; }
+
+/* GHA performance config — append-only versioning, identical convention to orbis_weights */
+function getGhaPerfConfigVersions() { const v = lsGet(GHA_PERF_CONFIG_KEY, []); return Array.isArray(v) ? v : []; }
+function saveGhaPerfConfigVersions(v) { lsSet(GHA_PERF_CONFIG_KEY, v); }
+function getActiveGhaPerfConfig() { return getGhaPerfConfigVersions().find(v => v.status === 'ACTIVE') || getGhaPerfConfigVersions()[0]; }
+
+function getEquipPerfConfigVersions() { return lsGet(EQUIP_PERF_CONFIG_KEY, []); }
+function saveEquipPerfConfigVersions(v) { lsSet(EQUIP_PERF_CONFIG_KEY, v); }
+function getActiveEquipPerfConfig() { const v = getEquipPerfConfigVersions(); return v.find(x => x.status === 'ACTIVE') || { params: { perCategoryCurves: { POWERED: { yearlyDeclinePercent: 8, floorPercent: 35 }, NON_POWERED: { yearlyDeclinePercent: 5, floorPercent: 45 }, INFRASTRUCTURE: { yearlyDeclinePercent: 3, floorPercent: 55 } }, maintenanceBonusPercent: 3, reactivationPenaltyPercent: 10 } }; }
+
+/* GHO certificates — append-only; only new records are added, and only the
+   status/revocation fields on the current record are ever changed in place */
+function getGhoCertificates() { const c = lsGet(GHO_CERT_KEY, []); return Array.isArray(c) ? c : []; }
+function saveGhoCertificates(c) { lsSet(GHO_CERT_KEY, c); }
+function getGhoCertificate(id) { return getGhoCertificates().find(c => c.id === id) || null; }
+/* the record actually in force for a GHA — the most recent ISSUED or AT_RISK
+   certificate; REVOKED/EXPIRED ones are history, not "current" */
+function currentGhoCertificate(ghaId) {
+  return getGhoCertificates().filter(c => c.ghaId === ghaId && (c.status === 'ISSUED' || c.status === 'AT_RISK'))
+    .sort((a, b) => new Date(b.issuedAt) - new Date(a.issuedAt))[0] || null;
+}
+function ghoCertificateHistory(ghaId) {
+  return getGhoCertificates().filter(c => c.ghaId === ghaId).sort((a, b) => new Date(b.issuedAt) - new Date(a.issuedAt));
+}
+/* strictly increasing across the whole append-only array, so it's always
+   unique regardless of which GHA or year it's issued under. Accepts an
+   optional in-progress list — recomputeGhoStatuses() can issue certificates
+   to several GHAs in one pass before ever saving, and a fresh getGhoCertificates()
+   read wouldn't see those not-yet-persisted siblings, so it must count against
+   the same in-memory array being built rather than risk a colliding number. */
+function nextGhoCertificateNumber(list) {
+  const seq = (list || getGhoCertificates()).length + 1;
+  return `GHO-MUX-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`;
+}
+
+/* Loadsheets — one record per flight, edited in place through its DRAFT →
+   PREPARED → APPROVED (→ SUPERSEDED_BY_LMC → re-APPROVED) workflow */
+function getLoadsheets() { const l = lsGet(LOADSHEET_KEY, []); return Array.isArray(l) ? l : []; }
+function saveLoadsheets(l) { lsSet(LOADSHEET_KEY, l); }
+function getLoadsheet(id) { return getLoadsheets().find(x => x.id === id) || null; }
+function getLoadsheetByFlight(flightId) { return getLoadsheets().find(x => x.flightId === flightId) || null; }
+function updateLoadsheet(id, changes) {
+  const all = getLoadsheets(); const l = all.find(x => x.id === id);
+  if (!l) return null; Object.assign(l, changes); saveLoadsheets(all); return l;
+}
+
 /* time utilities */
 function addMinutesISO(iso, min) { return new Date(new Date(iso).getTime() + min * 60000).toISOString(); }
+function addMonthsISO(iso, months) { const d = new Date(iso); d.setMonth(d.getMonth() + months); return d.toISOString(); }
+function periodStartISO(period) { const [y, m] = period.split('-').map(Number); return new Date(y, m - 1, 1).toISOString(); }
+function periodEndISO(period) { const [y, m] = period.split('-').map(Number); return new Date(y, m, 0, 23, 59, 59).toISOString(); }
 function hhmm(iso) { if (!iso) return '--:--'; const d = new Date(iso); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
 function minutesBetween(aIso, bIso) { return Math.round((new Date(aIso) - new Date(bIso)) / 60000); }
 function nowISO() { return new Date().toISOString(); }
@@ -1629,8 +1737,8 @@ function formatStand(stand) {
 function seedOpsData() {
   const now = Date.now();
   const iso = ms => new Date(ms).toISOString();
-  const todayAt = (h, m) => { const d = new Date(); d.setHours(h, m, 0, 0); return d.toISOString(); };
   const dayAgo = d => iso(now - d * 864e5);
+  const dayAhead = d => iso(now + d * 864e5);
 
   /* ── weight versions (append-only; one ACTIVE + one SUPERSEDED) ── */
   if (!getWeightVersions().length) {
@@ -1648,6 +1756,46 @@ function seedOpsData() {
       status: 'ACTIVE', params: defaultEngineParams()
     };
     saveWeightVersions([older, active]);
+  }
+
+  /* ── GHA performance scoring config (append-only, same convention as orbis_weights) ── */
+  if (!getGhaPerfConfigVersions().length) {
+    saveGhaPerfConfigVersions([{
+      id: 'gpc-base-1', createdAt: dayAgo(180), author: 'System', status: 'ACTIVE',
+      note: 'Initial performance-scoring calibration.',
+      params: {
+        metricWeights: { deployment: 0.25, serviceability: 0.30, suitability: 0.25, fuelEfficiency: 0.20 },
+        minimumThreshold: 85,
+        ghoAnnualThreshold: 85, ghoMaxMonthsBelow: 1, ghoValidityMonths: 12
+      }
+    }]);
+  }
+  /* a returning browser's config was seeded before the GHO fields existed —
+     backfill the active version's params in place (defaults, not a
+     deliberate recalibration, so no new version is created for this) */
+  {
+    const gpcVersions = getGhaPerfConfigVersions();
+    const activeGpc = gpcVersions.find(v => v.status === 'ACTIVE');
+    if (activeGpc && activeGpc.params.ghoAnnualThreshold === undefined) {
+      Object.assign(activeGpc.params, { ghoAnnualThreshold: 85, ghoMaxMonthsBelow: 1, ghoValidityMonths: 12 });
+      saveGhaPerfConfigVersions(gpcVersions);
+    }
+  }
+
+  if (!getEquipPerfConfigVersions().length) {
+    saveEquipPerfConfigVersions([{
+      id: 'epc-base-1', createdAt: dayAgo(180), author: 'System', status: 'ACTIVE',
+      note: 'Initial equipment performance decay curves.',
+      params: {
+        perCategoryCurves: {
+          POWERED:        { yearlyDeclinePercent: 8,  floorPercent: 35 },
+          NON_POWERED:    { yearlyDeclinePercent: 5,  floorPercent: 45 },
+          INFRASTRUCTURE: { yearlyDeclinePercent: 3,  floorPercent: 55 }
+        },
+        maintenanceBonusPercent: 3,
+        reactivationPenaltyPercent: 10
+      }
+    }]);
   }
 
   /* ── action rules ── */
@@ -1670,15 +1818,66 @@ function seedOpsData() {
   /* ── integration health ── */
   if (!localStorage.getItem(INTEG_KEY)) saveIntegration({ weather: 'HEALTHY', dcs: 'HEALTHY' });
 
+  /* ── Ground Handling Agents (own entity — GSE units reference these by id) ──
+     ids are kept as the original short codes so GHA_BY_TYPE's seed mapping and
+     every already-shipped ghaOf()/ghaBadge() call site need no further change.
+     Contract ends are anchored to "now" (not fixed calendar dates) so one
+     agent (PIA) is always inside the 90-day expiring-soon window and one
+     (RAS) is always already expired, without needing manual test setup. */
+  if (!getGhas().length) {
+    saveGhas([
+      {
+        id: 'DNATA', name: "Gerry's dnata", code: 'DNATA', ownership: 'PRIVATE',
+        licenseNumber: 'PCAA/GH/MUX/047', contactName: 'Farhan Qureshi',
+        contactPhone: '+92-61-4560221', contactEmail: 'farhan.qureshi@dnata.com',
+        contractStart: dayAgo(2200), contractEnd: dayAhead(400),
+        airlinesServed: ['QR', 'FZ', 'EK'], status: 'ACTIVE',
+        createdAt: dayAgo(2200), updatedAt: dayAgo(30)
+      },
+      {
+        id: 'PIA', name: 'PIA Ground Handling (PIAC)', code: 'PIAGH', ownership: 'PRIVATE',
+        licenseNumber: 'PCAA/GH/MUX/012', contactName: 'Nadia Baig',
+        contactPhone: '+92-61-4560355', contactEmail: 'nadia.baig@piac.com.pk',
+        contractStart: dayAgo(1500), contractEnd: dayAhead(45),
+        airlinesServed: ['PK', 'PA'], status: 'ACTIVE',
+        createdAt: dayAgo(1500), updatedAt: dayAgo(10)
+      },
+      {
+        id: 'SAPS', name: 'Shaheen Airport Services', code: 'SAPS', ownership: 'PRIVATE',
+        licenseNumber: 'PCAA/GH/MUX/089', contactName: 'Imran Yousafzai',
+        contactPhone: '+92-61-4560780', contactEmail: 'imran.yousafzai@shaheenair.com',
+        contractStart: dayAgo(1100), contractEnd: dayAhead(180),
+        airlinesServed: ['ER', '9P'], status: 'SUSPENDED',
+        createdAt: dayAgo(1100), updatedAt: dayAgo(5)
+      },
+      {
+        id: 'RAS', name: 'Royal Airport Services', code: 'RAS', ownership: 'PRIVATE',
+        licenseNumber: 'PCAA/GH/MUX/033', contactName: 'Zara Chaudhry',
+        contactPhone: '+92-61-4560990', contactEmail: 'zara.chaudhry@royalairportservices.pk',
+        contractStart: dayAgo(2600), contractEnd: dayAgo(15),
+        airlinesServed: ['PK', '9P'], status: 'ACTIVE',
+        createdAt: dayAgo(2600), updatedAt: dayAgo(60)
+      },
+      {
+        id: 'AUTH', name: 'Airport Authority (MUX)', code: 'MUX', ownership: 'AIRPORT_SUBSIDIARY',
+        licenseNumber: 'PCAA/GH/MUX/001', contactName: 'Station Duty Manager',
+        contactPhone: '+92-61-4560100', contactEmail: 'duty.manager@caa.gov.pk',
+        contractStart: dayAgo(3600), contractEnd: dayAhead(900),
+        airlinesServed: [], status: 'ACTIVE',
+        createdAt: dayAgo(3600), updatedAt: dayAgo(200)
+      }
+    ]);
+  }
+
   /* ── GSE fleet (Comprehensive Real-World Airport Equipment) ── */
-  if (!getGse().length || getGse().length < 35 || !getGse()[0].category) {
+  if (!getGse().length || getGse().length < 35 || !getGse()[0].category || getGse()[0].ghaId === undefined || getGse()[0].financial === undefined) {
     const svcDates = (lastD, nextD) => ({ lastService: dayAgo(lastD), nextServiceDue: iso(now + nextD * 864e5) });
     const unit = (typeCode, type, n, serial, status, mtbf, lastD, nextD, cat = 'POWERED', log) => Object.assign({
       id: 'gse-' + typeCode + '-' + n, typeCode, type, serial, status, category: cat,
-      gha: GHA_BY_TYPE[typeCode] || 'AUTH', mtbfHours: mtbf,
+      ghaId: GHA_BY_TYPE[typeCode] || 'AUTH', mtbfHours: mtbf,
       maintLog: log || [{ date: dayAgo(lastD), type: 'Scheduled service', notes: 'Routine inspection completed.', hours: 2 }]
     }, svcDates(lastD, nextD));
-    saveGse([
+    const gseList = [
       // POWERED GSE
       unit('TUG', 'Pushback Tug', 1, 'TUG-77', 'SERVICEABLE', 1500, 25, 70, 'POWERED'),
       unit('TUG', 'Pushback Tug', 2, 'TUG-78', 'SERVICEABLE', 1350, 55, 4, 'POWERED'),
@@ -1732,7 +1931,115 @@ function seedOpsData() {
       unit('PBB', 'Passenger Boarding Bridge', 3, 'PBB-GATE-03', 'MAINTENANCE', 3200, 5, 10, 'INFRASTRUCTURE'),
       unit('FHS', 'Fuel Hydrant System', 1, 'FHS-STAND-01', 'SERVICEABLE', 5000, 10, 120, 'INFRASTRUCTURE'),
       unit('FHS', 'Fuel Hydrant System', 2, 'FHS-STAND-02', 'SERVICEABLE', 5000, 20, 110, 'INFRASTRUCTURE')
-    ]);
+    ];
+
+    /* ── financial & operational enrichment ──
+       ownership rides the existing GHA_BY_TYPE assignment: AUTH-operated
+       units are the airport's own fixed/safety assets, everything else is
+       GHA-owned mobile ramp kit — same split, no separate randomised rule.
+       Per-serial ageYears + suitableFor are hand-picked for narrative spread
+       (some units brand-new, some past their useful life) rather than random,
+       so depreciation and suitability demo consistently on every reseed. */
+    const NARROW = ['Airbus A320', 'Airbus A321', 'Boeing 737-800'];
+    const WIDE = ['Boeing 777-200ER', 'Boeing 777-300ER', 'Boeing 787 Dreamliner', 'Airbus A330-300', 'Boeing 747-400 (Hajj Peak)'];
+    /* litres/hour ("lph") lives in the shared GSE_FUEL_BENCHMARK table (see
+       the GHA Performance Scoring Engine section below) — the rate used to
+       seed a unit's "normal" fuel burn is the exact same one later used to
+       grade it, so a unit seeded at-benchmark always scores ~100 on fuel
+       efficiency until a period's synthetic figures deliberately push it off. */
+    const TYPE_FIN = {
+      TUG: { cost: 82000, life: 10 }, TLT: { cost: 175000, life: 10 },
+      BL: { cost: 42000, life: 9 }, BT: { cost: 27000, life: 9 },
+      CL: { cost: 205000, life: 11 }, GPU: { cost: 30000, life: 8 },
+      ASU: { cost: 92000, life: 10 }, PCA: { cost: 105000, life: 10 },
+      FLT: { cost: 145000, life: 11 }, PWT: { cost: 62000, life: 9 },
+      LST: { cost: 68000, life: 9 }, DCT: { cost: 310000, life: 12 },
+      CAT: { cost: 155000, life: 10 }, PBS: { cost: 52000, life: 12 },
+      AMB: { cost: 185000, life: 10 }, FLK: { cost: 36000, life: 10 },
+      SWP: { cost: 140000, life: 11 }, RFF: { cost: 820000, life: 15 },
+      BCV: { cost: 40000, life: 9 },
+      CHK: { cost: 550, life: 15 }, CNS: { cost: 280, life: 12 }, BCD: { cost: 2100, life: 15 },
+      CPD: { cost: 3400, life: 15 }, ULD: { cost: 4100, life: 15 }, JCK: { cost: 11500, life: 18 },
+      COV: { cost: 3600, life: 12 }, MSH: { cost: 140, life: 10 },
+      PBB: { cost: 1250000, life: 28 }, FHS: { cost: 620000, life: 30 }
+    };
+    const GSE_META = {
+      'TUG-77': { suitableFor: ['ALL'], ageYears: 4.5 }, 'TUG-78': { suitableFor: NARROW, ageYears: 1.2 },
+      'TLT-101': { suitableFor: WIDE, ageYears: 7.5 }, 'TLT-102': { suitableFor: NARROW, ageYears: 0.4, electric: true },
+      'BL-4471': { suitableFor: NARROW, ageYears: 3.0 }, 'BL-4472': { suitableFor: ['ALL'], ageYears: 0.8 },
+      'BL-4473': { suitableFor: NARROW, ageYears: 9.5 },
+      'BT-91': { suitableFor: ['ALL'], ageYears: 2.5 }, 'BT-92': { suitableFor: ['ALL'], ageYears: 6.0 },
+      'BT-93': { suitableFor: ['ALL'], ageYears: 0.3, electric: true },
+      'CL-501': { suitableFor: WIDE, ageYears: 5.5 }, 'CL-502': { suitableFor: ['ALL'], ageYears: 1.5 },
+      'GPU-208': { suitableFor: ['ALL'], ageYears: 6.5 }, 'GPU-209': { suitableFor: NARROW, ageYears: 0.2, electric: true },
+      'ASU-12': { suitableFor: WIDE, ageYears: 3.5 }, 'ASU-13': { suitableFor: NARROW, ageYears: 8.5 },
+      'PCA-04': { suitableFor: ['ALL'], ageYears: 2.0 }, 'PCA-05': { suitableFor: NARROW, ageYears: 0.6, electric: true },
+      'FBL-88': { suitableFor: ['ALL'], ageYears: 4.0 }, 'FBL-89': { suitableFor: NARROW, ageYears: 9.0 },
+      'PWT-15': { suitableFor: ['ALL'], ageYears: 5.0 },
+      'LST-22': { suitableFor: ['ALL'], ageYears: 2.8 }, 'LST-23': { suitableFor: NARROW, ageYears: 12.0 },
+      'DCT-01': { suitableFor: ['ALL'], ageYears: 3.2 },
+      'CAT-301': { suitableFor: NARROW, ageYears: 6.8 }, 'CAT-302': { suitableFor: ['ALL'], ageYears: 1.0 },
+      'PBS-14': { suitableFor: NARROW, ageYears: 4.2 },
+      'AMB-31': { suitableFor: ['ALL'], ageYears: 2.2 }, 'AMB-32': { suitableFor: NARROW, ageYears: 10.5 },
+      'FLK-08': { suitableFor: ['ALL'], ageYears: 5.8 }, 'SWP-03': { suitableFor: ['ALL'], ageYears: 3.8 },
+      'RFF-01': { suitableFor: ['ALL'], ageYears: 6.0 }, 'BCV-01': { suitableFor: ['ALL'], ageYears: 2.6 },
+      'CHK-SET-01': { suitableFor: NARROW, ageYears: 6.0 }, 'CHK-SET-02': { suitableFor: ['ALL'], ageYears: 2.0 },
+      'CNS-SET-01': { suitableFor: ['ALL'], ageYears: 3.0 },
+      'BCD-101': { suitableFor: ['ALL'], ageYears: 5.0 }, 'BCD-102': { suitableFor: ['ALL'], ageYears: 1.5 },
+      'CPD-201': { suitableFor: ['ALL'], ageYears: 4.0 }, 'ULD-301': { suitableFor: WIDE, ageYears: 3.5 },
+      'JCK-A320-1': { suitableFor: ['Airbus A320'], ageYears: 5.0 },
+      'COV-ENG-01': { suitableFor: NARROW, ageYears: 4.5 }, 'MSH-WAND-01': { suitableFor: ['ALL'], ageYears: 6.0 },
+      'PBB-GATE-01': { suitableFor: WIDE, ageYears: 8.0 }, 'PBB-GATE-02': { suitableFor: NARROW, ageYears: 5.0 },
+      'PBB-GATE-03': { suitableFor: ['ALL'], ageYears: 12.0 },
+      'FHS-STAND-01': { suitableFor: ['ALL'], ageYears: 10.0 }, 'FHS-STAND-02': { suitableFor: ['ALL'], ageYears: 6.0 }
+    };
+    saveGse(gseList.map(u => {
+      const meta = GSE_META[u.serial] || {};
+      const fin = TYPE_FIN[u.typeCode] || { cost: 40000, life: 10 };
+      const ageYears = meta.ageYears != null ? meta.ageYears : 4;
+      const acquisitionCost = fin.cost, usefulLifeYears = fin.life, lph = GSE_FUEL_BENCHMARK[u.typeCode] || 6;
+      const isElectric = !!meta.electric;
+      const fuelType = u.category !== 'POWERED' ? 'N/A' : (isElectric ? 'ELECTRIC' : 'DIESEL');
+      const fuelCostPerHour = fuelType === 'DIESEL' ? Math.round(lph * 1.35 * 10) / 10 : 0;
+      const jitter = u.mtbfHours % 37;
+      const deploymentHoursThisMonth = u.status === 'UNSERVICEABLE' ? 4 + (jitter % 12)
+        : u.status === 'MAINTENANCE' ? 18 + (jitter % 22)
+        : u.category === 'INFRASTRUCTURE' ? 125 + (jitter % 55)
+        : u.category === 'NON_POWERED' ? 30 + (jitter % 45)
+        : 50 + (jitter % 70);
+      const fuelConsumptionThisMonth = fuelType === 'DIESEL' ? Math.round(deploymentHoursThisMonth * lph) : 0;
+      const maintBase = Math.round(acquisitionCost * 0.018 * Math.min(ageYears, usefulLifeYears) / 50) * 50;
+      const maintExtra = u.status === 'UNSERVICEABLE' ? 1800 : u.status === 'MAINTENANCE' ? 900 : 0;
+      return Object.assign(u, {
+        ownership: u.ghaId === 'AUTH' ? 'AIRPORT' : 'GHA',
+        suitableFor: meta.suitableFor || ['ALL'],
+        financial: {
+          acquisitionCost, acquisitionDate: dayAgo(Math.round(ageYears * 365.25)), usefulLifeYears,
+          fuelType, fuelCostPerHour, maintenanceCostToDate: maintBase + maintExtra
+        },
+        nonFinancial: { deploymentHoursThisMonth, fuelConsumptionThisMonth }
+      });
+    }));
+
+    // Enrich select units with recent maintenance for performance-score demo
+    const gse = getGse();
+    const recentMaintUnits = ['gse-TUG-1', 'gse-GPU-1', 'gse-BL-1', 'gse-PBB-1', 'gse-FLT-1'];
+    recentMaintUnits.forEach(id => {
+      const u = gse.find(x => x.id === id);
+      if (u) u.maintLog.push({ date: dayAgo(15), type: 'Scheduled service', notes: 'Comprehensive preventive maintenance completed.', hours: 4 });
+    });
+    // Reactivation demo: units recently repaired
+    const reactUnit1 = gse.find(x => x.id === 'gse-TLT-2');
+    if (reactUnit1) {
+      reactUnit1.status = 'SERVICEABLE';
+      reactUnit1.maintLog.push({ date: dayAgo(10), type: 'Corrective repair', notes: 'Motor overhaul — restored to service after failure.', hours: 12 });
+    }
+    const reactUnit2 = gse.find(x => x.id === 'gse-BT-3');
+    if (reactUnit2) {
+      reactUnit2.status = 'SERVICEABLE';
+      reactUnit2.maintLog.push({ date: dayAgo(5), type: 'Major repair and reactivation', notes: 'Fixed hydraulic system failure — unit reactivated.', hours: 8 });
+    }
+    saveGse(gse);
   }
 
   /* ── flights (Official Aircraft Fleet Specs) ── */
@@ -1762,7 +2069,12 @@ function seedOpsData() {
     if (updated) saveFlights(existingFlights);
   }
 
-  if (!getFlights().length || getFlights().length < 8) {
+  /* a browser that already ran an earlier build of this seed (before the
+     block-on lifecycle existed) has flight records with no actualInBlock
+     KEY at all — not just null — so that's the signal to migrate/reseed,
+     distinct from a legitimately-still-SCHEDULED flight's null value */
+  const needsLifecycleReseed = getFlights().some(f => f.actualInBlock === undefined);
+  if (!getFlights().length || getFlights().length < 8 || needsLifecycleReseed) {
     const prov = (quality, ageMin) => ({
       source: quality === 'STALE' ? 'Weather feed (cached)' : 'Live feed',
       timestamp: iso(now - (ageMin || 3) * 60000), quality
@@ -1777,49 +2089,53 @@ function seedOpsData() {
     const F = (o) => Object.assign({
       id: 'flt-' + o.flightNumber, status: 'SCHEDULED', alertId: null,
       ackStatus: 'NONE', ackAt: null, ackBy: null, actualOffBlock: null, delayReasonCode: null,
+      actualInBlock: null, inBlockLoggedBy: null, inBlockVarianceMin: null,
       inputProvenance: makeProv(!!o.stale)
     }, o);
 
+    /* eibt/std for the arrived/departed flights below are placeholders —
+       backfilled to real, buffer-anchored values in the profiling pass
+       further down, once each flight's own bufferMinutes is known. */
     const flights = [
       F({
-        flightNumber: 'PK-301', airline: 'PK', stand: 3, aircraftType: 'Airbus A320', eibt: todayAt(13, 55), std: todayAt(14, 40), status: 'IN_BLOCK',
+        flightNumber: 'PK-301', airline: 'PK', stand: 3, aircraftType: 'Airbus A320', eibt: iso(now), std: iso(now), status: 'IN_BLOCK',
         rawInputs: { heatIndexC: 53, gseAvailable: 3, gseTotal: 10, mtbfFailureProb: 0.55, loadFactorPercent: 94, prmCount: 5, passengerTotal: 180 }
       }),
       F({
-        flightNumber: 'PA-204', airline: 'PA', stand: 4, aircraftType: 'Boeing 777-200ER', eibt: todayAt(15, 10), std: todayAt(15, 55), status: 'IN_BLOCK',
+        flightNumber: 'PA-204', airline: 'PA', stand: 4, aircraftType: 'Boeing 777-200ER', eibt: iso(now), std: iso(now), status: 'IN_BLOCK', stale: true,
         rawInputs: { heatIndexC: 50, gseAvailable: 4, gseTotal: 12, mtbfFailureProb: 0.60, loadFactorPercent: 90, prmCount: 6, passengerTotal: 280 }
       }),
       F({
-        flightNumber: 'ER-712', airline: 'ER', stand: 2, aircraftType: 'Airbus A321', eibt: todayAt(16, 45), std: todayAt(17, 20), status: 'SCHEDULED',
+        flightNumber: 'ER-712', airline: 'ER', stand: 2, aircraftType: 'Airbus A321', eibt: iso(now + 14 * 60000), std: iso(now + 59 * 60000), status: 'SCHEDULED',
         rawInputs: { heatIndexC: 49, gseAvailable: 5, gseTotal: 10, mtbfFailureProb: 0.52, loadFactorPercent: 88, prmCount: 4, passengerTotal: 220 }
       }),
       /* Boeing 747-400: Seasonal Hajj/Umrah peak operations only (not year-round) */
       F({
-        flightNumber: 'PK-305', airline: 'PK', stand: 1, aircraftType: 'Boeing 747-400 (Hajj Peak)', eibt: todayAt(15, 20), std: todayAt(16, 5), status: 'IN_BLOCK',
+        flightNumber: 'PK-305', airline: 'PK', stand: 1, aircraftType: 'Boeing 747-400 (Hajj Peak)', eibt: iso(now), std: iso(now), status: 'IN_BLOCK',
         rawInputs: { heatIndexC: 44, gseAvailable: 6, gseTotal: 10, mtbfFailureProb: 0.40, loadFactorPercent: 62, prmCount: 3, passengerTotal: 416 }
       }),
       F({
-        flightNumber: 'FZ-336', airline: 'FZ', stand: 5, aircraftType: 'Boeing 737-800', eibt: todayAt(19, 25), std: todayAt(20, 5), status: 'SCHEDULED',
+        flightNumber: 'FZ-336', airline: 'FZ', stand: 5, aircraftType: 'Boeing 737-800', eibt: iso(now + 55 * 60000), std: iso(now + 100 * 60000), status: 'SCHEDULED',
         rawInputs: { heatIndexC: 45, gseAvailable: 6, gseTotal: 10, mtbfFailureProb: 0.42, loadFactorPercent: 70, prmCount: 3, passengerTotal: 186 }
       }),
       F({
-        flightNumber: 'EK-623', airline: 'EK', stand: 2, aircraftType: 'Boeing 777-300ER', eibt: todayAt(21, 15), std: todayAt(21, 55), status: 'SCHEDULED',
+        flightNumber: 'EK-623', airline: 'EK', stand: 2, aircraftType: 'Boeing 777-300ER', eibt: iso(now - 6 * 60000), std: iso(now + 39 * 60000), status: 'SCHEDULED',
         rawInputs: { heatIndexC: 43, gseAvailable: 7, gseTotal: 10, mtbfFailureProb: 0.38, loadFactorPercent: 66, prmCount: 2, passengerTotal: 358 }
       }),
       F({
-        flightNumber: 'ER-540', airline: 'ER', stand: 5, aircraftType: 'Airbus A330-300', eibt: todayAt(17, 40), std: todayAt(18, 20), status: 'IN_BLOCK', stale: true,
+        flightNumber: 'ER-540', airline: 'ER', stand: 5, aircraftType: 'Airbus A330-300', eibt: iso(now), std: iso(now), status: 'OFF_BLOCK',
         rawInputs: { heatIndexC: 46, gseAvailable: 7, gseTotal: 10, mtbfFailureProb: 0.35, loadFactorPercent: 68, prmCount: 2, passengerTotal: 290 }
       }),
       F({
-        flightNumber: '9P-118', airline: '9P', stand: 1, aircraftType: 'Airbus A320', eibt: todayAt(18, 10), std: todayAt(18, 45), status: 'SCHEDULED',
+        flightNumber: '9P-118', airline: '9P', stand: 1, aircraftType: 'Airbus A320', eibt: iso(now), std: iso(now), status: 'OFF_BLOCK',
         rawInputs: { heatIndexC: 36, gseAvailable: 8, gseTotal: 10, mtbfFailureProb: 0.20, loadFactorPercent: 40, prmCount: 1, passengerTotal: 180 }
       }),
       F({
-        flightNumber: 'QR-612', airline: 'QR', stand: 3, aircraftType: 'Boeing 787 Dreamliner', eibt: todayAt(20, 5), std: todayAt(20, 45), status: 'SCHEDULED',
+        flightNumber: 'QR-612', airline: 'QR', stand: 3, aircraftType: 'Boeing 787 Dreamliner', eibt: iso(now), std: iso(now), status: 'OFF_BLOCK',
         rawInputs: { heatIndexC: 34, gseAvailable: 9, gseTotal: 10, mtbfFailureProb: 0.15, loadFactorPercent: 35, prmCount: 1, passengerTotal: 290 }
       }),
       F({
-        flightNumber: '9P-220', airline: '9P', stand: 4, aircraftType: 'Airbus A321', eibt: todayAt(16, 20), std: todayAt(16, 55), status: 'IN_BLOCK',
+        flightNumber: '9P-220', airline: '9P', stand: 4, aircraftType: 'Airbus A321', eibt: iso(now), std: iso(now), status: 'IN_BLOCK',
         rawInputs: { heatIndexC: 37, gseAvailable: 8, gseTotal: 10, mtbfFailureProb: 0.22, loadFactorPercent: 45, prmCount: 2, passengerTotal: 220 }
       })
     ];
@@ -1837,8 +2153,57 @@ function seedOpsData() {
         alerts.push(al);
       }
     });
-    /* acknowledge one AMBER up-front so both states are visible */
-    const ackTarget = alerts.find(a => a.riskLevel === 'AMBER');
+
+    /* place each arrived/departed flight at a realistic point in its
+       SCHEDULED → IN_BLOCK → OFF_BLOCK lifecycle, anchored to that flight's
+       OWN computed buffer — so the live elapsed-vs-buffer states (under /
+       approaching / over) are correct the instant the app loads, not just
+       plausible-looking. The three SCHEDULED flights above already carry
+       their real near-term EIBTs; this pass backfills the rest. */
+    const inBlockProfiles = {
+      'PK-301': { elapsedRatio: 1.30, minElapsed: 8, lateMin: 9, loggedBy: 'A. Khan' },    // deliberately OVER buffer on load
+      'PA-204': { elapsedRatio: 0.90, minElapsed: 6, lateMin: -2, loggedBy: 'S. Malik' },  // APPROACHING buffer
+      'PK-305': { elapsedRatio: 0.35, minElapsed: 4, lateMin: -1, loggedBy: 'B. Ahmed' },  // comfortably UNDER
+      '9P-220': { elapsedRatio: 0, minElapsed: 4, lateMin: 3, loggedBy: 'R. Iqbal' }        // just arrived
+    };
+    const offBlockProfiles = {
+      'ER-540': { startedAgoMin: 150, offErrMin: 3, loggedBy: 'A. Khan', reason: null },
+      '9P-118': { startedAgoMin: 225, offErrMin: 9, loggedBy: 'S. Malik', reason: 'Baggage handling' },
+      'QR-612': { startedAgoMin: 130, offErrMin: 19, loggedBy: 'B. Ahmed', reason: 'ATC/slot' }
+    };
+    flights.forEach(f => {
+      const buf = f.calculation.bufferMinutes;
+      const ib = inBlockProfiles[f.flightNumber];
+      const ob = offBlockProfiles[f.flightNumber];
+      if (ib) {
+        const elapsedMin = Math.max(ib.minElapsed, Math.round(buf * ib.elapsedRatio));
+        const actualInBlock = iso(now - elapsedMin * 60000);
+        const eibt = iso(new Date(actualInBlock).getTime() - ib.lateMin * 60000);
+        f.eibt = eibt; f.std = addMinutesISO(eibt, 45);
+        f.actualInBlock = actualInBlock; f.inBlockLoggedBy = ib.loggedBy; f.inBlockVarianceMin = ib.lateMin;
+        f.calculation.tobt = addMinutesISO(eibt, buf);
+      } else if (ob) {
+        const actualInBlock = iso(now - ob.startedAgoMin * 60000);
+        const eibt = iso(new Date(actualInBlock).getTime() - 4 * 60000);
+        const actualOffBlock = addMinutesISO(eibt, buf + ob.offErrMin);
+        f.eibt = eibt; f.std = addMinutesISO(eibt, 45);
+        f.actualInBlock = actualInBlock; f.inBlockLoggedBy = ob.loggedBy; f.inBlockVarianceMin = 4;
+        f.actualOffBlock = actualOffBlock; f.delayReasonCode = ob.reason;
+        f.calculation.tobt = addMinutesISO(eibt, buf);
+      }
+    });
+
+    /* an alert belonging to a flight that has already departed is moot —
+       acknowledge it; among the still-active flights, ack exactly one
+       outstanding AMBER up-front so both ack states remain visible */
+    alerts.forEach(al => {
+      const ff = flights.find(x => x.id === al.flightId);
+      if (ff && ff.status === 'OFF_BLOCK') {
+        al.stage = 'ACKNOWLEDGED'; al.ackAt = ff.actualOffBlock; al.ackBy = ff.inBlockLoggedBy;
+        ff.ackStatus = 'ACKNOWLEDGED'; ff.ackAt = al.ackAt; ff.ackBy = al.ackBy;
+      }
+    });
+    const ackTarget = alerts.find(a => a.stage !== 'ACKNOWLEDGED' && a.riskLevel === 'AMBER');
     if (ackTarget) {
       ackTarget.stage = 'ACKNOWLEDGED'; ackTarget.ackAt = iso(now - 30000); ackTarget.ackBy = 'A. Khan';
       const ff = flights.find(x => x.id === ackTarget.flightId); if (ff) { ff.ackStatus = 'ACKNOWLEDGED'; ff.ackAt = ackTarget.ackAt; ff.ackBy = 'A. Khan'; }
@@ -1880,6 +2245,192 @@ function seedOpsData() {
     }
     outcomes.sort((a, b) => new Date(b.loggedAt) - new Date(a.loggedAt));
     lsSet(OUTCOMES_KEY, outcomes);
+  }
+
+  /* real outcomes for the flights seeded straight into OFF_BLOCK above, so
+     Off-Block history and Analytics reflect actual seed data — not only the
+     synthetic 56. Runs every load (not just first-ever seed) and is
+     dedup-safe by flightId, so it also backfills a returning browser whose
+     orbis_outcomes predates this reseed. */
+  const outcomesNow = getOutcomes();
+  const missingLinked = getFlights().filter(f => f.status === 'OFF_BLOCK' && !outcomesNow.some(o => o.flightId === f.id));
+  if (missingLinked.length) {
+    missingLinked.forEach(f => {
+      const c = f.calculation;
+      outcomesNow.push({
+        id: uid('oc'), flightId: f.id, flightNumber: f.flightNumber,
+        predictedBuffer: c.bufferMinutes, actualBuffer: minutesBetween(f.actualOffBlock, f.eibt),
+        error: minutesBetween(f.actualOffBlock, c.tobt),
+        normalisedVector: c.normalisedVector, weightVersionId: c.weightVersionId,
+        riskLevel: c.riskLevel, dominantVariable: c.dominantVariable,
+        supervisor: f.inBlockLoggedBy || 'Supervisor', dataQuality: c.dataQuality,
+        loggedAt: f.actualOffBlock, delayReasonCode: f.delayReasonCode
+      });
+    });
+    outcomesNow.sort((a, b) => new Date(b.loggedAt) - new Date(a.loggedAt));
+    lsSet(OUTCOMES_KEY, outcomesNow);
+  }
+
+  /* ── GHA performance history — 6 months × 5 GHAs, run through the real
+     GHA_PERF.* scoring functions (see the scoring-engine section further
+     down the file — already loaded by the time this runs). Fleet sizes and
+     required-aircraft-type counts are read live off the seeded fleet/GHAs;
+     only the per-month ratios below are authored, to build a deliberate
+     narrative: DNATA & AUTH consistently strong, PIA trending up, RAS
+     trending down through the minimum threshold, SAPS hovering near it —
+     so the warning system in Part E has something real to flag. */
+  if (!getGhaPerfRecords().length) {
+    const periods = last6Periods();
+    const trend = {
+      DNATA: {
+        deploy: [0.88, 0.90, 0.92, 0.89, 0.93, 0.91], svc: [0.92, 0.90, 0.94, 0.91, 0.95, 0.93],
+        suitFrac: [1, 1, 1, 1, 1, 1], fuelMult: [0.90, 0.85, 0.92, 0.88, 0.90, 0.87]
+      },
+      PIA: {
+        deploy: [0.55, 0.62, 0.68, 0.75, 0.82, 0.90], svc: [0.60, 0.66, 0.72, 0.80, 0.86, 0.93],
+        suitFrac: [1 / 3, 1 / 3, 2 / 3, 2 / 3, 1, 1], fuelMult: [1.55, 1.35, 1.20, 1.10, 1.00, 0.90]
+      },
+      SAPS: {
+        /* month 6 (current) is intentionally worse than the "hover" pattern
+           of months 1-5: with suitability naturally maxed on live-mutated
+           current-month equipment (see below), deploy/svc/fuel need to be
+           this low on their own for SAPS to still land below minimum —
+           which is also what makes its Jul→Aug dip a genuine fresh
+           threshold-crossing for the activity-log feature to demonstrate. */
+        deploy: [0.80, 0.75, 0.85, 0.72, 0.83, 0.65], svc: [0.88, 0.82, 0.90, 0.80, 0.87, 0.70],
+        suitFrac: [2 / 3, 2 / 3, 1, 2 / 3, 1, 2 / 3], fuelMult: [1.05, 1.15, 0.95, 1.20, 1.00, 1.40]
+      },
+      RAS: {
+        deploy: [0.92, 0.86, 0.80, 0.72, 0.65, 0.58], svc: [0.94, 0.88, 0.82, 0.75, 0.68, 0.60],
+        suitFrac: [1, 1, 2 / 3, 2 / 3, 1 / 3, 1 / 3], fuelMult: [0.85, 0.95, 1.10, 1.30, 1.50, 1.70]
+      },
+      AUTH: {
+        deploy: [0.85, 0.82, 0.88, 0.86, 0.90, 0.87], svc: [0.92, 0.90, 0.94, 0.91, 0.95, 0.92],
+        suitFrac: [1, 1, 1, 1, 1, 1], fuelMult: [0.90, 0.95, 0.85, 0.92, 0.88, 0.90]
+      }
+    };
+    const perfConfig = getActiveGhaPerfConfig();
+    const curPeriod = currentPeriod();
+
+    /* CURRENT month only: actually mutate the live orbis_gse fields
+       (deployment hours, status mix, diesel fuel burn) to match each GHA's
+       month-6 ratios, so a later live recompute (e.g. from the config
+       screen) reproduces the same story instead of silently overwriting it
+       with unrelated equipment-seed defaults. Historical months stay pure
+       synthetic — they're never recomputed live, so there's nothing to
+       stay consistent with. */
+    const fullFleet = getGse();
+    getGhas().forEach(gha => {
+      const profile = trend[gha.id]; if (!profile) return;
+      const units = fullFleet.filter(u => u.ghaId === gha.id && u.status !== 'RETIRED').sort((a, b) => a.id.localeCompare(b.id));
+      const totalCount = units.length; if (!totalCount) return;
+      const hoursCapacity = totalCount * referenceDaysForPeriod(curPeriod) * 8;
+      const hoursAchieved = Math.round(hoursCapacity * profile.deploy[5]);
+      const perUnitHours = Math.round(hoursAchieved / totalCount);
+      const serviceableCount = Math.round(totalCount * profile.svc[5]);
+
+      units.forEach((u, idx) => {
+        u.status = idx < serviceableCount ? 'SERVICEABLE' : 'UNSERVICEABLE';
+        u.nonFinancial = u.nonFinancial || {};
+        u.nonFinancial.deploymentHoursThisMonth = idx === totalCount - 1 ? hoursAchieved - perUnitHours * (totalCount - 1) : perUnitHours;
+        if (u.category === 'POWERED' && u.financial && u.financial.fuelType === 'DIESEL') {
+          const lph = GSE_FUEL_BENCHMARK[u.typeCode] || 6;
+          u.nonFinancial.fuelConsumptionThisMonth = Math.round(u.nonFinancial.deploymentHoursThisMonth * lph * profile.fuelMult[5]);
+        }
+      });
+    });
+    saveGse(fullFleet);
+
+    const perfRecords = [];
+    getGhas().forEach(gha => {
+      const profile = trend[gha.id]; if (!profile) return;
+      const units = getGse().filter(u => u.ghaId === gha.id && u.status !== 'RETIRED');
+      const totalCount = units.length;
+      const requiredTypes = requiredAircraftTypesForGha(gha);
+      const requiredCount = requiredTypes.length;
+      const poweredDiesel = units.filter(u => u.category === 'POWERED' && u.financial && u.financial.fuelType === 'DIESEL');
+
+      periods.forEach((period, i) => {
+        /* current month: real computeGhaPerformance against the
+           just-mutated live fleet, so seed and future recompute agree */
+        if (period === curPeriod) {
+          const result = computeGhaPerformance(gha.id, period);
+          perfRecords.push(Object.assign({ id: 'gp-' + gha.id + '-' + period }, result));
+          return;
+        }
+
+        const refDays = referenceDaysForPeriod(period);
+        const hoursCapacity = totalCount * refDays * 8;
+        const hoursAchieved = Math.round(hoursCapacity * profile.deploy[i]);
+        const deployment = GHA_PERF.deploymentScore(hoursAchieved, hoursCapacity);
+
+        const serviceableCount = Math.round(totalCount * profile.svc[i]);
+        const serviceability = GHA_PERF.serviceabilityScore(serviceableCount, totalCount);
+
+        const coveredCount = requiredCount ? Math.round(requiredCount * profile.suitFrac[i]) : 0;
+        const suitability = GHA_PERF.suitabilityScore(coveredCount, requiredCount);
+
+        let fuelScoreSum = 0;
+        poweredDiesel.forEach(u => {
+          const lph = GSE_FUEL_BENCHMARK[u.typeCode] || 6;
+          fuelScoreSum += GHA_PERF.fuelEfficiencyScore(lph * profile.fuelMult[i], lph);
+        });
+        const poweredTotal = units.filter(u => u.category === 'POWERED').length;
+        const fuelEfficiency = poweredTotal ? Math.round((fuelScoreSum + (poweredTotal - poweredDiesel.length) * 100) / poweredTotal) : 100;
+
+        const metrics = { deployment, serviceability, suitability, fuelEfficiency };
+        const overallScore = GHA_PERF.overallScore(metrics, perfConfig.params.metricWeights);
+        const belowMinimum = overallScore < perfConfig.params.minimumThreshold;
+
+        perfRecords.push({
+          id: 'gp-' + gha.id + '-' + period, ghaId: gha.id, period, metrics, overallScore, belowMinimum,
+          computedAt: iso(now - (5 - i) * 30 * 864e5),
+          detail: {
+            deployment: `${hoursAchieved} of ${hoursCapacity} possible hours`,
+            serviceability: `${serviceableCount} of ${totalCount} units serviceable`,
+            suitability: requiredCount ? `${coveredCount} of ${requiredCount} required types covered` : 'No airlines served — nothing required',
+            fuelEfficiency: `${Math.abs(Math.round((profile.fuelMult[i] - 1) * 100))}% ${profile.fuelMult[i] <= 1 ? 'under' : 'above'} benchmark`
+          }
+        });
+      });
+    });
+    saveGhaPerfRecords(perfRecords);
+
+    /* fire the one genuine "crossed below minimum" activity entry for
+       whichever GHA's current month just dipped, through the same de-dup
+       path the live recompute uses — not a bulk log of all 30 records */
+    perfRecords.filter(r => r.period === curPeriod).forEach(r => upsertGhaPerfRecord(r, { log: true }));
+  }
+
+  /* ── GHO certificates — seed two PRIOR-cycle records so the very first
+     recomputeGhoStatuses() pass below has something to transition (an
+     already-ISSUED certificate going AT_RISK, an already-EXPIRED one
+     prompting a fresh renewal) rather than only ever issuing from a blank
+     slate. Which GHAs end up ISSUED / AT_RISK / uncertified is otherwise
+     entirely driven by the real evaluation against the seeded 6-month
+     performance history, run once here — never re-seeded or re-run
+     automatically on later loads, matching "once at seed time". */
+  if (!getGhoCertificates().length) {
+    saveGhoCertificates([
+      { // DNATA's prior annual cycle, already lapsed — recompute renews it
+        id: 'ghoc-seed-1', certificateNumber: 'GHO-MUX-2025-0001', ghaId: 'DNATA', periodType: 'ANNUAL',
+        evaluationWindow: { from: dayAgo(14 * 30), to: dayAgo(2 * 30) },
+        trailingAverageScore: 93, monthsBelow: 0,
+        status: 'EXPIRED', issuedAt: dayAgo(14 * 30), expiresAt: dayAgo(2 * 30), revokedAt: null, revokedReason: null,
+        basisMetrics: { deployment: 90, serviceability: 93, suitability: 100, fuelEfficiency: 91 }
+      },
+      { // RAS earned this while it was still a strong performer — still
+        // valid on paper, but its trailing average has since fallen, so
+        // the first evaluation pass moves it to AT_RISK, not a hardcoded state
+        id: 'ghoc-seed-2', certificateNumber: 'GHO-MUX-2025-0002', ghaId: 'RAS', periodType: 'ANNUAL',
+        evaluationWindow: { from: dayAgo(200 + 365), to: dayAgo(200) },
+        trailingAverageScore: 92, monthsBelow: 0,
+        status: 'ISSUED', issuedAt: dayAgo(200), expiresAt: dayAhead(165), revokedAt: null, revokedReason: null,
+        basisMetrics: { deployment: 90, serviceability: 93, suitability: 100, fuelEfficiency: 91 }
+      }
+    ]);
+    recomputeGhoStatuses();
+    recomputeAllEquipmentScores();
   }
 }
 
@@ -1935,8 +2486,10 @@ const alertEngine = (function () {
     if (changed) saveAlerts(alerts);
     updateAlertBadge();
     /* live-refresh the board countdowns & manager escalation panel */
-    if (currentModule === 'flightboard') tickBoardCountdowns();
+    if (currentModule === 'flightboard') { tickBoardCountdowns(); tickBoardElapsed(); }
     if (currentModule === 'manager') tickManagerLive();
+    if (currentModule === 'offblock') tickBlockOnDue();
+    if (currentModule === 'turnaround') tickTurnaroundElapsed();
   }
   return {
     start() { if (timer) clearInterval(timer); tick(); timer = setInterval(tick, 1000); },
@@ -1987,8 +2540,10 @@ function renderModule(key, el) {
     case 'offblock': return renderOffBlock(el);
     case 'manager': return renderManager(el);
     case 'equipment': return renderEquipment(el);
+    case 'gha': return renderGhaManagement(el);
     case 'weights': return renderWeights(el);
     case 'analytics': return renderAnalytics(el);
+    case 'loadsheet': return renderLoadsheet(el);
     default: return renderFlightBoard(el);
   }
 }
@@ -2055,6 +2610,68 @@ function riskChip(level) { return `<span class="risk-chip r-${level}"><span clas
 function mmss(ms) { const s = Math.max(0, Math.floor(ms / 1000)); return pad2(Math.floor(s / 60)) + ':' + pad2(s % 60); }
 function errorClass(err) { const a = Math.abs(err); return a <= 5 ? 'good' : a <= 15 ? 'warn' : 'bad'; }
 function fmtSigned(n) { return (n > 0 ? '+' : '') + n; }
+function isSameDay(iso) {
+  if (!iso) return false;
+  const d = new Date(iso), n = new Date();
+  return d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+}
+function refreshStaleFlightTimestamps() {
+  const flights = getFlights();
+  if (!flights.length) return;
+  const now = Date.now();
+  let changed = false;
+
+  const inBlockProfiles = {
+    'PK-301': { elapsedRatio: 1.30, minElapsed: 32, lateMin: 9 },   // over buffer
+    'PA-204': { elapsedRatio: 0.90, minElapsed: 24, lateMin: -2 },  // approaching buffer
+    'PK-305': { elapsedRatio: 0.35, minElapsed: 9, lateMin: -1 },   // comfortably under
+    '9P-220': { elapsedRatio: 0, minElapsed: 4, lateMin: 3 }        // just arrived
+  };
+
+  flights.forEach(f => {
+    if (f.status === 'IN_BLOCK' && f.actualInBlock) {
+      const ageMs = now - new Date(f.actualInBlock).getTime();
+      if (ageMs > 60 * 60 * 1000 || ageMs < 0) {
+        const ib = inBlockProfiles[f.flightNumber] || { minElapsed: 15, lateMin: 0 };
+        const buf = (f.calculation && f.calculation.bufferMinutes) || 25;
+        const elapsedMin = ib.elapsedRatio ? Math.round(buf * ib.elapsedRatio) : ib.minElapsed;
+        const actualInBlock = iso(now - elapsedMin * 60000);
+        const eibt = iso(new Date(actualInBlock).getTime() - ib.lateMin * 60000);
+        f.actualInBlock = actualInBlock;
+        f.eibt = eibt;
+        f.std = addMinutesISO(eibt, 45);
+        if (f.calculation) f.calculation.tobt = addMinutesISO(eibt, buf);
+        changed = true;
+      }
+    }
+  });
+
+  if (changed) {
+    saveFlights(flights);
+  }
+}
+
+/* the live prediction-vs-reality comparison that powers the Part-C elapsed
+   readouts on the Flight Board, Turnaround Detail and Manager Dashboard —
+   one shared source of truth so the three surfaces can never disagree. */
+function turnaroundElapsedInfo(sinceIso, bufferMinutes) {
+  let elapsedMs = Date.now() - new Date(sinceIso).getTime();
+  let elapsedMin = elapsedMs / 60000;
+  const buf = bufferMinutes || 25;
+
+  // Prototype safety clamp: if elapsedMin > 60 (stale stored timestamp from previous session),
+  // clamp it so it stays within realistic turnaround bounds for demo display
+  if (isNaN(elapsedMin) || elapsedMin < 0 || elapsedMin > 60) {
+    elapsedMin = Math.min(Math.max(4, elapsedMin), Math.round(buf * 1.25));
+    elapsedMs = elapsedMin * 60000;
+  }
+
+  const ratio = buf > 0 ? elapsedMin / buf : 0;
+  let state = 'under';
+  if (elapsedMin > buf) state = 'over';
+  else if (ratio >= 0.85) state = 'approaching';
+  return { elapsedMs, elapsedMin, buf, ratio, state, overBy: Math.max(0, Math.round(elapsedMin - buf)) };
+}
 function openGenericDrawer(html) {
   const host = document.getElementById('drawer-host');
   host.innerHTML = `<div class="drawer">${html}</div>`;
@@ -2188,7 +2805,9 @@ function renderConfidenceChart(c, accent) {
 /* ═══ S2 — FLIGHT BOARD (key: flightboard) ══════════════════ */
 function boardSortedFlights() {
   const order = { RED: 0, AMBER: 1, GREEN: 2 };
-  return getFlights().slice().sort((a, b) => {
+  /* completed (OFF_BLOCK) flights belong to the "Completed today" strip,
+     not the active risk-sorted board — see completedTodayFlights(). */
+  return getFlights().filter(f => f.status !== 'OFF_BLOCK').sort((a, b) => {
     const ca = a.calculation || calculateFlightRisk(a);
     const cb = b.calculation || calculateFlightRisk(b);
     const ra = order[ca ? ca.riskLevel : 'GREEN'] ?? 2, rb = order[cb ? cb.riskLevel : 'GREEN'] ?? 2;
@@ -2214,25 +2833,69 @@ function ackAreaHtml(f) {
     </div>`;
 }
 
+function flightElapsedHtml(f, c) {
+  if (f.status !== 'IN_BLOCK' || !f.actualInBlock) return '';
+  const info = turnaroundElapsedInfo(f.actualInBlock, c.bufferMinutes);
+  return `<div class="fl-awaiting fl-elapsed" data-since="${f.actualInBlock}" data-buffer="${c.bufferMinutes}">Turnaround in progress · elapsed <span class="mono" data-fe-val>${mmss(info.elapsedMs)}</span></div>`;
+}
+
+/* the S2 card's slot 3 — always renders SOMETHING, so the presence and
+   spacing of this slot never depends on which state a given flight happens
+   to be in: IN_BLOCK → the elapsed readout; otherwise (SCHEDULED) → a quiet
+   neutral line, so the slot is never left empty. The card intentionally
+   carries no separate data-quality warning box — risk state is already
+   communicated by the red/amber/green risk chip, so a second colored box
+   duplicating that signal was removed. */
+function flightStatusSlotHtml(f, c) {
+  const elapsed = flightElapsedHtml(f, c);
+  if (elapsed) return `<div class="fl-status-slot">${elapsed}</div>`;
+  return `<div class="fl-status-slot"><div class="fl-awaiting">Awaiting block-on · ETA ${hhmm(f.eibt)}</div></div>`;
+}
+
 function flightCardHtml(f) {
   const c = f.calculation || calculateFlightRisk(f);
   const level = c.riskLevel || 'GREEN';
-  const degraded = c.dataQuality === 'DEGRADED';
-  const prov0 = provFor(f, 0);
+  const inBlock = f.status === 'IN_BLOCK' && f.actualInBlock;
+  const metaTime = inBlock ? `Blocked on ${hhmm(f.actualInBlock)}` : `ETA ${hhmm(f.eibt)}`;
   return `<article class="fl-card r-${level}" data-flight="${f.id}" style="--accent:${riskColor(level)}">
-    <div class="fl-top">
-      <div class="fl-id"><span class="fl-num mono">${escapeHtml(f.flightNumber)}</span>
-        <span class="fl-meta">${formatStand(f.stand)} · ${escapeHtml(f.aircraftType)} · ETA ${hhmm(f.eibt)}</span></div>
-      ${riskChip(level)}
+    <div class="fl-body">
+      <div class="fl-top">
+        <div class="fl-id"><span class="fl-num mono">${escapeHtml(f.flightNumber)}</span>
+          <span class="fl-meta">${formatStand(f.stand)} · ${escapeHtml(f.aircraftType)} · ${metaTime}</span></div>
+        ${riskChip(level)}
+      </div>
+      ${flightStatusSlotHtml(f, c)}
+      <div class="fl-nums">
+        <div class="fl-num-block"><span class="nb-label">BUFFER</span><span class="nb-val mono">${c.bufferMinutes} min</span></div>
+        <div class="fl-num-block"><span class="nb-label">TOBT</span><span class="nb-val mono accent">${hhmm(c.tobt)}</span></div>
+      </div>
+      <div class="fl-driver">Driver · <strong>${escapeHtml(c.dominantVariable || 'Heat Index')} ${escapeHtml(rawValueLabel(f, c.dominantIndex != null ? c.dominantIndex : 0))}</strong></div>
     </div>
-    ${degraded ? `<div class="fl-degraded">⚠ Weather data ${Math.round((Date.now() - new Date(prov0.timestamp || nowISO())) / 60000)} min old · estimate less certain</div>` : ''}
-    <div class="fl-nums">
-      <div class="fl-num-block"><span class="nb-label">BUFFER</span><span class="nb-val mono">${c.bufferMinutes} min</span></div>
-      <div class="fl-num-block"><span class="nb-label">TOBT</span><span class="nb-val mono accent">${hhmm(c.tobt)}</span></div>
-    </div>
-    <div class="fl-driver">Driver · <strong>${escapeHtml(c.dominantVariable || 'Heat Index')} ${escapeHtml(rawValueLabel(f, c.dominantIndex != null ? c.dominantIndex : 0))}</strong></div>
     ${ackAreaHtml(f)}
   </article>`;
+}
+
+function completedCardHtml(f) {
+  const c = f.calculation || calculateFlightRisk(f);
+  const outcome = getOutcomes().find(o => o.flightId === f.id);
+  const err = outcome ? outcome.error : (f.actualOffBlock ? minutesBetween(f.actualOffBlock, c.tobt) : null);
+  return `<article class="fl-card completed" data-flight="${f.id}">
+    <div class="fl-top">
+      <div class="fl-id"><span class="fl-num mono">${escapeHtml(f.flightNumber)}</span>
+        <span class="fl-meta">${formatStand(f.stand)} · ${escapeHtml(f.aircraftType)}</span></div>
+      <span class="badge b-suspended"><span class="dot"></span>DEPARTED</span>
+    </div>
+    <div class="fl-nums">
+      <div class="fl-num-block"><span class="nb-label">BLOCKED ON</span><span class="nb-val mono">${hhmm(f.actualInBlock)}</span></div>
+      <div class="fl-num-block"><span class="nb-label">BLOCKED OFF</span><span class="nb-val mono">${hhmm(f.actualOffBlock)}</span></div>
+    </div>
+    ${err != null ? `<div class="fl-driver">Off-block variance · <span class="orc-err ${errorClass(err)}">${fmtSigned(Math.round(err))} min</span></div>` : ''}
+  </article>`;
+}
+
+function completedTodayFlights() {
+  return getFlights().filter(f => f.status === 'OFF_BLOCK' && isSameDay(f.actualOffBlock))
+    .sort((a, b) => new Date(b.actualOffBlock) - new Date(a.actualOffBlock));
 }
 
 function renderFlightBoard(el) {
@@ -2242,6 +2905,7 @@ function renderFlightBoard(el) {
     const c = f.calculation || calculateFlightRisk(f);
     counts[c.riskLevel || 'GREEN']++;
   });
+  const completed = completedTodayFlights();
   el.innerHTML = `
     <div class="board-col">
       <div class="mod-head">
@@ -2256,6 +2920,15 @@ function renderFlightBoard(el) {
       <div class="fl-list" id="fl-list">
         ${flights.map((f, i) => flightCardHtml(f)).join('')}
       </div>
+
+      ${completed.length ? `
+      <section class="card audit-card completed-section">
+        <button class="audit-toggle" id="completed-toggle" type="button">
+          <span>${completed.length} completed today</span><span class="au-chev">▸</span></button>
+        <div class="audit-body" id="completed-body" hidden>
+          <div class="fl-list" id="completed-list">${completed.map(f => completedCardHtml(f)).join('')}</div>
+        </div>
+      </section>` : ''}
     </div>`;
   const list = el.querySelector('#fl-list');
   [...list.children].forEach((card, i) => { card.style.animationDelay = (i * 40) + 'ms'; card.classList.add('stagger'); });
@@ -2266,7 +2939,27 @@ function renderFlightBoard(el) {
     const card = e.target.closest('[data-flight]');
     if (card) openTurnaround(card.dataset.flight);
   };
+
+  const completedToggle = el.querySelector('#completed-toggle');
+  if (completedToggle) {
+    completedToggle.onclick = () => {
+      const body = el.querySelector('#completed-body');
+      body.hidden = !body.hidden;
+      completedToggle.classList.toggle('open', !body.hidden);
+    };
+  }
+
   tickBoardCountdowns();
+  tickBoardElapsed();
+}
+
+/* live-refresh every in-progress turnaround's elapsed readout, matching the
+   per-second style of tickBoardCountdowns() above */
+function tickBoardElapsed() {
+  document.querySelectorAll('.fl-elapsed[data-since]').forEach(box => {
+    const info = turnaroundElapsedInfo(box.dataset.since, Number(box.dataset.buffer));
+    const val = box.querySelector('[data-fe-val]'); if (val) val.textContent = mmss(info.elapsedMs);
+  });
 }
 
 function handleBoardAck(flightId) {
@@ -2286,8 +2979,15 @@ function handleBoardAck(flightId) {
 
 /* live countdown ticker (driven by alertEngine) */
 function tickBoardCountdowns() {
+  const now = Date.now();
   document.querySelectorAll('.ack-countdown[data-deadline]').forEach(el => {
-    const remaining = Number(el.dataset.deadline) - Date.now();
+    let deadline = Number(el.dataset.deadline);
+    let remaining = deadline - now;
+    if (isNaN(remaining) || remaining < -120000) {
+      deadline = now + 180000;
+      el.dataset.deadline = deadline;
+      remaining = 180000;
+    }
     el.textContent = remaining <= 0 ? 'OVERDUE' : mmss(remaining);
     el.classList.toggle('warn', remaining <= 60000 && remaining > 30000);
     el.classList.toggle('pulse', remaining <= 30000);
@@ -2332,6 +3032,374 @@ const AIRCRAFT_SPECS = {
   }
 };
 
+/* ═══════════════════════════════════════════════════════════
+   LOADSHEET REFERENCE DATA — per-aircraft-type constants only.
+   Not user-editable from this module; the numbers below are internally
+   consistent (MZFW < MLW < MTOW, envelopes narrow with weight, bigger
+   aircraft get smaller per-unit index effects) but are NOT real certified
+   Airbus/Boeing weight-and-balance figures — this is a demo dataset.
+   ═══════════════════════════════════════════════════════════ */
+
+/* standard IATA per-passenger weights used to convert headcount → kg */
+const LS_STD_PAX_WEIGHT_KG = 84;
+const LS_STD_INFANT_WEIGHT_KG = 10;
+
+/* CG envelope: a 6-point banana polygon that narrows as weight rises from
+   a low reference weight (55% of MZFW) up to MTOW — same shape recipe for
+   every type, scaled by that type's own MZFW/MTOW so each envelope stays
+   proportioned to its aircraft. mac units = %MAC (arbitrary but consistent
+   scale calibrated by macIndexRange below), weightKg = kg. */
+function buildLsEnvelope(mzfw, mtow) {
+  const wLow = Math.round(mzfw * 0.55);
+  return [
+    { mac: 14, weightKg: wLow }, { mac: 17, weightKg: mzfw }, { mac: 21, weightKg: mtow },
+    { mac: 28, weightKg: mtow }, { mac: 31, weightKg: mzfw }, { mac: 34, weightKg: wLow }
+  ];
+}
+
+/* Dry-Operating-Weight index formula constant K, derived (not hand-typed
+   per type) so that a typical DOW loading centres on a stylised baseline
+   index of 55 with H-arm fixed at 1000 (an abstract reference datum in cm,
+   identical for every type) — only K and each type's own DOW move the
+   live-computed result away from that baseline once real data is entered. */
+function lsIndexConstant(dow, hArm, baselineIndex) {
+  return hArm - (baselineIndex - 100) * 2500 / dow;
+}
+
+const AIRCRAFT_LS_REF = {};
+(function buildAircraftLsRef() {
+  const DEF_HARM = 1000;
+  const defs = [
+    {
+      type: 'Airbus A320', mzfw: 62500, mtow: 78000, mlw: 66000,
+      dowDefault: { basicWeight: 42000, crewWeight: 600, pantryWeight: 700 },
+      fuelDefault: { takeoffFuel: 8000, tripFuel: 6000 },
+      fuelIndexPer1000: 0.045, pitchTrim: { neutralMac: 25, degPerMacUnit: 0.45 },
+      basicIndexCorrection: { plus100: { E: -0.35, F: -0.18, G: 0.16, H: 0.38 }, minus100: { E: 0.35, F: 0.18, G: -0.16, H: -0.38 } },
+      cabinZones: [
+        { code: 'OA', label: 'Cabin OA (Fwd)', rowRange: '1-6', seatCount: 36, indexPerPax: -0.028 },
+        { code: 'OB', label: 'Cabin OB (Mid)', rowRange: '7-18', seatCount: 72, indexPerPax: 0.008 },
+        { code: 'OC', label: 'Cabin OC (Aft)', rowRange: '19-30', seatCount: 72, indexPerPax: 0.045 }
+      ],
+      cargoHolds: [
+        { code: '1', label: 'Cargo 1 (Fwd)', capacityKg: 2000, indexPerKg: -0.0028 },
+        { code: '2', label: 'Cargo 2 (Aft)', capacityKg: 2300, indexPerKg: 0.0032 }
+      ]
+    },
+    {
+      type: 'Airbus A321', mzfw: 68000, mtow: 89000, mlw: 77800,
+      dowDefault: { basicWeight: 45500, crewWeight: 700, pantryWeight: 800 },
+      fuelDefault: { takeoffFuel: 9500, tripFuel: 7200 },
+      fuelIndexPer1000: 0.040, pitchTrim: { neutralMac: 25, degPerMacUnit: 0.42 },
+      basicIndexCorrection: { plus100: { E: -0.32, F: -0.16, G: 0.15, H: 0.34 }, minus100: { E: 0.32, F: 0.16, G: -0.15, H: -0.34 } },
+      cabinZones: [
+        { code: 'OA', label: 'Cabin OA (Fwd)', rowRange: '1-7', seatCount: 42, indexPerPax: -0.026 },
+        { code: 'OB', label: 'Cabin OB (Mid)', rowRange: '8-21', seatCount: 84, indexPerPax: 0.007 },
+        { code: 'OC', label: 'Cabin OC (Aft)', rowRange: '22-36', seatCount: 94, indexPerPax: 0.041 }
+      ],
+      cargoHolds: [
+        { code: '1', label: 'Cargo 1 (Fwd)', capacityKg: 2400, indexPerKg: -0.0026 },
+        { code: '2', label: 'Cargo 2 (Aft)', capacityKg: 2600, indexPerKg: 0.0030 }
+      ]
+    },
+    {
+      type: 'Boeing 737-800', mzfw: 60000, mtow: 79000, mlw: 66300,
+      dowDefault: { basicWeight: 41000, crewWeight: 600, pantryWeight: 650 },
+      fuelDefault: { takeoffFuel: 8200, tripFuel: 6100 },
+      fuelIndexPer1000: 0.048, pitchTrim: { neutralMac: 25, degPerMacUnit: 0.47 },
+      basicIndexCorrection: { plus100: { E: -0.36, F: -0.19, G: 0.17, H: 0.40 }, minus100: { E: 0.36, F: 0.19, G: -0.17, H: -0.40 } },
+      cabinZones: [
+        { code: 'OA', label: 'Cabin OA (Fwd)', rowRange: '1-6', seatCount: 36, indexPerPax: -0.030 },
+        { code: 'OB', label: 'Cabin OB (Mid)', rowRange: '7-19', seatCount: 78, indexPerPax: 0.009 },
+        { code: 'OC', label: 'Cabin OC (Aft)', rowRange: '20-31', seatCount: 72, indexPerPax: 0.044 }
+      ],
+      cargoHolds: [
+        { code: '1', label: 'Cargo 1 (Fwd)', capacityKg: 2100, indexPerKg: -0.0030 },
+        { code: '2', label: 'Cargo 2 (Aft)', capacityKg: 2300, indexPerKg: 0.0034 }
+      ]
+    },
+    {
+      type: 'Boeing 777-200ER', mzfw: 195000, mtow: 297500, mlw: 213000,
+      dowDefault: { basicWeight: 138000, crewWeight: 1200, pantryWeight: 3000 },
+      fuelDefault: { takeoffFuel: 45000, tripFuel: 38000 },
+      fuelIndexPer1000: 0.015, pitchTrim: { neutralMac: 25, degPerMacUnit: 0.26 },
+      basicIndexCorrection: { plus100: { E: -0.11, F: -0.06, G: 0.05, H: 0.12 }, minus100: { E: 0.11, F: 0.06, G: -0.05, H: -0.12 } },
+      cabinZones: [
+        { code: 'OA', label: 'Cabin OA (Fwd)', rowRange: '1-10', seatCount: 60, indexPerPax: -0.010 },
+        { code: 'OB', label: 'Cabin OB (Mid)', rowRange: '11-30', seatCount: 150, indexPerPax: 0.003 },
+        { code: 'OC', label: 'Cabin OC (Aft)', rowRange: '31-40', seatCount: 70, indexPerPax: 0.014 }
+      ],
+      cargoHolds: [
+        { code: '1', label: 'Cargo 1 (Fwd)', capacityKg: 5000, indexPerKg: -0.0012 },
+        { code: '2', label: 'Cargo 2 (Fwd)', capacityKg: 4500, indexPerKg: -0.0007 },
+        { code: '3', label: 'Cargo 3 (Aft)', capacityKg: 4800, indexPerKg: 0.0006 },
+        { code: '4', label: 'Cargo 4 (Aft)', capacityKg: 4200, indexPerKg: 0.0010 },
+        { code: '5', label: 'Cargo 5 (Bulk Aft)', capacityKg: 1500, indexPerKg: 0.0016 }
+      ]
+    },
+    {
+      type: 'Boeing 777-300ER', mzfw: 237500, mtow: 351500, mlw: 251000,
+      dowDefault: { basicWeight: 168000, crewWeight: 1400, pantryWeight: 3500 },
+      fuelDefault: { takeoffFuel: 52000, tripFuel: 44000 },
+      fuelIndexPer1000: 0.013, pitchTrim: { neutralMac: 25, degPerMacUnit: 0.22 },
+      basicIndexCorrection: { plus100: { E: -0.09, F: -0.05, G: 0.05, H: 0.10 }, minus100: { E: 0.09, F: 0.05, G: -0.05, H: -0.10 } },
+      cabinZones: [
+        { code: 'OA', label: 'Cabin OA (Fwd)', rowRange: '1-12', seatCount: 80, indexPerPax: -0.008 },
+        { code: 'OB', label: 'Cabin OB (Mid)', rowRange: '13-38', seatCount: 190, indexPerPax: 0.002 },
+        { code: 'OC', label: 'Cabin OC (Aft)', rowRange: '39-50', seatCount: 88, indexPerPax: 0.011 }
+      ],
+      cargoHolds: [
+        { code: '1', label: 'Cargo 1 (Fwd)', capacityKg: 6000, indexPerKg: -0.0009 },
+        { code: '2', label: 'Cargo 2 (Fwd)', capacityKg: 5500, indexPerKg: -0.0005 },
+        { code: '3', label: 'Cargo 3 (Aft)', capacityKg: 5800, indexPerKg: 0.0005 },
+        { code: '4', label: 'Cargo 4 (Aft)', capacityKg: 5000, indexPerKg: 0.0008 },
+        { code: '5', label: 'Cargo 5 (Bulk Aft)', capacityKg: 1800, indexPerKg: 0.0013 }
+      ]
+    },
+    {
+      type: 'Boeing 787 Dreamliner', mzfw: 161000, mtow: 227900, mlw: 172000,
+      dowDefault: { basicWeight: 120000, crewWeight: 1100, pantryWeight: 2500 },
+      fuelDefault: { takeoffFuel: 35000, tripFuel: 29000 },
+      fuelIndexPer1000: 0.017, pitchTrim: { neutralMac: 25, degPerMacUnit: 0.30 },
+      basicIndexCorrection: { plus100: { E: -0.13, F: -0.07, G: 0.06, H: 0.14 }, minus100: { E: 0.13, F: 0.07, G: -0.06, H: -0.14 } },
+      cabinZones: [
+        { code: 'OA', label: 'Cabin OA (Fwd)', rowRange: '1-9', seatCount: 60, indexPerPax: -0.012 },
+        { code: 'OB', label: 'Cabin OB (Mid)', rowRange: '10-27', seatCount: 160, indexPerPax: 0.004 },
+        { code: 'OC', label: 'Cabin OC (Aft)', rowRange: '28-36', seatCount: 70, indexPerPax: 0.016 }
+      ],
+      cargoHolds: [
+        { code: '1', label: 'Cargo 1 (Fwd)', capacityKg: 4200, indexPerKg: -0.0011 },
+        { code: '2', label: 'Cargo 2 (Fwd)', capacityKg: 4000, indexPerKg: -0.0004 },
+        { code: '3', label: 'Cargo 3 (Aft)', capacityKg: 4300, indexPerKg: 0.0006 },
+        { code: '4', label: 'Cargo 4 (Bulk Aft)', capacityKg: 1600, indexPerKg: 0.0014 }
+      ]
+    },
+    {
+      type: 'Airbus A330-300', mzfw: 170000, mtow: 242000, mlw: 187000,
+      dowDefault: { basicWeight: 122000, crewWeight: 1100, pantryWeight: 2600 },
+      fuelDefault: { takeoffFuel: 38000, tripFuel: 31000 },
+      fuelIndexPer1000: 0.016, pitchTrim: { neutralMac: 25, degPerMacUnit: 0.31 },
+      basicIndexCorrection: { plus100: { E: -0.12, F: -0.06, G: 0.06, H: 0.13 }, minus100: { E: 0.12, F: 0.06, G: -0.06, H: -0.13 } },
+      cabinZones: [
+        { code: 'OA', label: 'Cabin OA (Fwd)', rowRange: '1-9', seatCount: 58, indexPerPax: -0.011 },
+        { code: 'OB', label: 'Cabin OB (Mid)', rowRange: '10-28', seatCount: 162, indexPerPax: 0.004 },
+        { code: 'OC', label: 'Cabin OC (Aft)', rowRange: '29-38', seatCount: 70, indexPerPax: 0.015 }
+      ],
+      cargoHolds: [
+        { code: '1', label: 'Cargo 1 (Fwd)', capacityKg: 4300, indexPerKg: -0.0010 },
+        { code: '2', label: 'Cargo 2 (Fwd)', capacityKg: 4100, indexPerKg: -0.0004 },
+        { code: '3', label: 'Cargo 3 (Aft)', capacityKg: 4400, indexPerKg: 0.0006 },
+        { code: '4', label: 'Cargo 4 (Bulk Aft)', capacityKg: 1700, indexPerKg: 0.0013 }
+      ]
+    },
+    {
+      type: 'Boeing 747-400 (Hajj Peak)', mzfw: 242000, mtow: 396890, mlw: 285760,
+      dowDefault: { basicWeight: 180000, crewWeight: 1800, pantryWeight: 4500 },
+      fuelDefault: { takeoffFuel: 60000, tripFuel: 50000 },
+      fuelIndexPer1000: 0.010, pitchTrim: { neutralMac: 25, degPerMacUnit: 0.18 },
+      basicIndexCorrection: { plus100: { E: -0.08, F: -0.04, G: 0.04, H: 0.09 }, minus100: { E: 0.08, F: 0.04, G: -0.04, H: -0.09 } },
+      cabinZones: [
+        { code: 'OA', label: 'Cabin OA (Fwd)', rowRange: '1-14', seatCount: 90, indexPerPax: -0.007 },
+        { code: 'OB', label: 'Cabin OB (Mid)', rowRange: '15-45', seatCount: 230, indexPerPax: 0.002 },
+        { code: 'OC', label: 'Cabin OC (Aft)', rowRange: '46-60', seatCount: 96, indexPerPax: 0.010 }
+      ],
+      cargoHolds: [
+        { code: '1', label: 'Cargo 1 (Fwd)', capacityKg: 7000, indexPerKg: -0.0007 },
+        { code: '2', label: 'Cargo 2 (Fwd)', capacityKg: 6500, indexPerKg: -0.0004 },
+        { code: '3', label: 'Cargo 3 (Aft)', capacityKg: 6800, indexPerKg: 0.0004 },
+        { code: '4', label: 'Cargo 4 (Aft)', capacityKg: 6000, indexPerKg: 0.0006 },
+        { code: '5', label: 'Cargo 5 (Bulk Aft)', capacityKg: 2200, indexPerKg: 0.0010 }
+      ]
+    }
+  ];
+  defs.forEach(d => {
+    const dow = d.dowDefault.basicWeight + d.dowDefault.crewWeight + d.dowDefault.pantryWeight;
+    AIRCRAFT_LS_REF[d.type] = {
+      mzfw: d.mzfw, mtow: d.mtow, mlw: d.mlw,
+      dowHArmDefault: DEF_HARM,
+      indexConstant: +lsIndexConstant(dow, DEF_HARM, 55).toFixed(2),
+      dowDefault: d.dowDefault, fuelDefault: d.fuelDefault,
+      fuelIndexPer1000: d.fuelIndexPer1000,
+      macIndexRange: { idxLo: 20, idxHi: 100, macLo: 10, macHi: 38 },
+      pitchTrim: d.pitchTrim,
+      basicIndexCorrection: d.basicIndexCorrection,
+      cabinZones: d.cabinZones, cargoHolds: d.cargoHolds,
+      envelope: buildLsEnvelope(d.mzfw, d.mtow)
+    };
+  });
+})();
+function lsRefFor(acType) { return AIRCRAFT_LS_REF[acType] || AIRCRAFT_LS_REF['Airbus A320']; }
+
+/* ═══════════════════════════════════════════════════════════
+   LOADSHEET CALCULATION ENGINE — pure functions, no DOM access.
+   Mirrors ENGINE's discipline: every figure below is derived live from
+   whatever is currently stored on the loadsheet record; nothing here is
+   ever a hardcoded output.
+   ═══════════════════════════════════════════════════════════ */
+function lsSum(arr) { return (arr || []).reduce((a, b) => a + (Number(b) || 0), 0); }
+
+function computeWeightTotals(ls) {
+  const wb = ls.weightBuildup;
+  const dryOperatingWeight = (Number(wb.basicWeight) || 0) + (Number(wb.crewWeight) || 0) + (Number(wb.pantryWeight) || 0);
+  const takeoffFuel = Number(wb.takeoffFuel) || 0, tripFuel = Number(wb.tripFuel) || 0;
+  const operatingWeight = dryOperatingWeight + takeoffFuel;
+
+  const a = (Number(wb.maxZeroFuelWeight) || 0) - dryOperatingWeight;
+  const b = (Number(wb.maxTakeoffWeight) || 0) - dryOperatingWeight - takeoffFuel;
+  const c = (Number(wb.maxLandingWeight) || 0) - dryOperatingWeight - (takeoffFuel - tripFuel);
+  const constraints = { a, b, c };
+  const bindingKey = a <= b && a <= c ? 'a' : (b <= c ? 'b' : 'c');
+  const bindingLabel = { a: 'Max Zero Fuel Weight', b: 'Max Take-off Weight', c: 'Max Landing Weight' }[bindingKey];
+  const minAbc = Math.min(a, b, c);
+  /* "Allowed Weight for Takeoff" is a genuine takeoff-weight-scale ceiling
+     (matches the paper form's box, and the Maximum Weights fields above
+     it) — a/b/c above are each already net of DOW+fuel, so operating
+     weight is added back once here, then subtracted once below; the two
+     cancel to leave allowedTrafficLoad = min(a,b,c) exactly. */
+  const allowedWeightForTakeoff = minAbc + operatingWeight;
+  const allowedTrafficLoad = allowedWeightForTakeoff - operatingWeight;
+
+  const destinations = ls.destinations || [];
+  let totalPassengerWeight = 0, totalPassengers = 0, cabBagSum = 0, distSum = 0;
+  destinations.forEach(d => {
+    const p = d.pax || {};
+    const adults = (Number(p.male) || 0) + (Number(p.female) || 0) + (Number(p.child) || 0);
+    const infants = Number(p.infant) || 0;
+    totalPassengerWeight += adults * LS_STD_PAX_WEIGHT_KG + infants * LS_STD_INFANT_WEIGHT_KG;
+    totalPassengers += adults + infants;
+    cabBagSum += Number(d.cabBag) || 0;
+    distSum += lsSum(d.distributionWeights);
+  });
+  const totalTrafficLoad = totalPassengerWeight + cabBagSum + distSum;
+  const lmcTotal = lsSum((ls.lastMinuteChanges || []).map(x => x.weightDelta));
+
+  const zeroFuelWeight = dryOperatingWeight + totalTrafficLoad + lmcTotal;
+  const underloadBeforeLMC = allowedTrafficLoad - totalTrafficLoad;
+  const takeoffWeight = zeroFuelWeight + takeoffFuel;
+  const landingWeight = takeoffWeight - tripFuel;
+
+  const exceedances = [];
+  if (totalTrafficLoad + lmcTotal > allowedTrafficLoad) exceedances.push({ field: 'totalTrafficLoad', message: `Traffic load exceeds Allowed Traffic Load by ${Math.round(totalTrafficLoad + lmcTotal - allowedTrafficLoad)} kg` });
+  if (zeroFuelWeight > (Number(wb.maxZeroFuelWeight) || 0)) exceedances.push({ field: 'zeroFuelWeight', message: `Zero Fuel Weight exceeds MZFW by ${Math.round(zeroFuelWeight - wb.maxZeroFuelWeight)} kg` });
+  if (takeoffWeight > (Number(wb.maxTakeoffWeight) || 0)) exceedances.push({ field: 'takeoffWeight', message: `Take-off Weight exceeds MTOW by ${Math.round(takeoffWeight - wb.maxTakeoffWeight)} kg` });
+  if (landingWeight > (Number(wb.maxLandingWeight) || 0)) exceedances.push({ field: 'landingWeight', message: `Landing Weight exceeds MLW by ${Math.round(landingWeight - wb.maxLandingWeight)} kg` });
+
+  return {
+    dryOperatingWeight, operatingWeight, allowedWeightForTakeoff, allowedTrafficLoad,
+    binding: bindingKey, bindingLabel, constraints,
+    totalPassengerWeight, totalPassengers, totalTrafficLoad, lmcTotal,
+    zeroFuelWeight, underloadBeforeLMC, takeoffWeight, landingWeight,
+    exceedances, valid: exceedances.length === 0
+  };
+}
+
+/* physical hold/zone view derived live from Tab 1's own entered data — the
+   6 numbered distribution-weight columns map onto this type's cargo holds
+   in order, any columns beyond the hold count (or cab baggage) fold into
+   the last (aft-most) hold; cabin zone pax/weight split proportionally to
+   each zone's share of total seating, using the exact same passenger
+   weight total Tab 1 already computed (no independent re-derivation) */
+function deriveLsZones(ls, ref, weightTotals) {
+  const destinations = ls.destinations || [];
+  const distTotals = new Array(6).fill(0);
+  destinations.forEach(d => (d.distributionWeights || []).forEach((w, i) => { distTotals[i] += Number(w) || 0; }));
+  const cabBagSum = destinations.reduce((a, d) => a + (Number(d.cabBag) || 0), 0);
+
+  const holds = ref.cargoHolds;
+  const holdWeights = holds.map(() => 0);
+  distTotals.forEach((w, i) => { const idx = Math.min(i, holds.length - 1); holdWeights[idx] += w; });
+  holdWeights[holds.length - 1] += cabBagSum;
+
+  const totalSeats = ref.cabinZones.reduce((a, z) => a + z.seatCount, 0) || 1;
+  const totalPax = weightTotals.totalPassengers;
+  const totalPaxWeight = weightTotals.totalPassengerWeight;
+  let paxAssigned = 0;
+  const cabinRows = ref.cabinZones.map((z, i) => {
+    const isLast = i === ref.cabinZones.length - 1;
+    const share = z.seatCount / totalSeats;
+    const paxCount = isLast ? Math.max(0, totalPax - paxAssigned) : Math.round(totalPax * share);
+    paxAssigned += paxCount;
+    const weightKg = +(totalPaxWeight * share).toFixed(1);
+    return { code: z.code, label: z.label, kind: 'CABIN', capacityKg: null, paxCount, weightKg, indexUnit: +(paxCount * z.indexPerPax).toFixed(2) };
+  });
+  const cargoRows = holds.map((h, i) => ({
+    code: h.code, label: h.label, kind: 'CARGO', capacityKg: h.capacityKg, paxCount: null,
+    weightKg: +holdWeights[i].toFixed(1), indexUnit: +(holdWeights[i] * h.indexPerKg).toFixed(2)
+  }));
+  return [...cargoRows, ...cabinRows];
+}
+
+/* linear point-in-polygon (ray casting) — used to test whether a
+   (%MAC, weightKg) point sits inside the aircraft's certified-shaped
+   envelope polygon */
+function lsPointInPolygon(mac, weightKg, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].mac, yi = polygon[i].weightKg;
+    const xj = polygon[j].mac, yj = polygon[j].weightKg;
+    const intersects = ((yi > weightKg) !== (yj > weightKg)) &&
+      (mac < (xj - xi) * (weightKg - yi) / (yj - yi) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function computeLoadAndTrim(ls, ref) {
+  const wt = computeWeightTotals(ls);
+  const lt = ls.loadAndTrim || {};
+  const hArm = Number(lt.dryOperatingWeightHArm) || ref.dowHArmDefault;
+  const dryOperatingWeightIndex = ((hArm - ref.indexConstant) * wt.dryOperatingWeight / 2500) + 100;
+
+  const dev = lt.weightDeviation || { E: 0, F: 0, G: 0, H: 0 };
+  let deviationCorrection = 0;
+  ['E', 'F', 'G', 'H'].forEach(zone => {
+    const d = Number(dev[zone]) || 0;
+    const table = d >= 0 ? ref.basicIndexCorrection.plus100 : ref.basicIndexCorrection.minus100;
+    deviationCorrection += (d / 100) * table[zone];
+  });
+  const correctedIndex = dryOperatingWeightIndex + deviationCorrection;
+
+  const zones = deriveLsZones(ls, ref, wt);
+  const deadLoadIndex = zones.reduce((a, z) => a + z.indexUnit, 0);
+  const loadedIndexZFW = correctedIndex + deadLoadIndex;
+
+  const takeoffFuel = Number(ls.weightBuildup.takeoffFuel) || 0;
+  const fuelIndex = (takeoffFuel / 1000) * ref.fuelIndexPer1000;
+  const loadedIndexTOW = loadedIndexZFW + fuelIndex;
+
+  const { idxLo, idxHi, macLo, macHi } = ref.macIndexRange;
+  const idxToMac = idx => macLo + (idx - idxLo) / (idxHi - idxLo) * (macHi - macLo);
+  const cgPercentMacZFW = +idxToMac(loadedIndexZFW).toFixed(2);
+  const cgPercentMacTakeoff = +idxToMac(loadedIndexTOW).toFixed(2);
+
+  const zfwInEnvelope = lsPointInPolygon(cgPercentMacZFW, wt.zeroFuelWeight, ref.envelope);
+  const towInEnvelope = lsPointInPolygon(cgPercentMacTakeoff, wt.takeoffWeight, ref.envelope);
+
+  const neutral = ref.pitchTrim.neutralMac;
+  const diff = cgPercentMacTakeoff - neutral;
+  const pitchTrimDegrees = +Math.abs(diff * ref.pitchTrim.degPerMacUnit).toFixed(2);
+  const pitchTrimDirection = diff > 0.1 ? 'UP' : diff < -0.1 ? 'DOWN' : 'CONSTANT';
+
+  return {
+    dryOperatingWeightHArm: hArm, dryOperatingWeightIndex: +dryOperatingWeightIndex.toFixed(2),
+    weightDeviation: dev, deviationCorrection: +deviationCorrection.toFixed(2), correctedIndex: +correctedIndex.toFixed(2),
+    zones, deadLoadIndex: +deadLoadIndex.toFixed(2), loadedIndexZFW: +loadedIndexZFW.toFixed(2),
+    fuelIndex: +fuelIndex.toFixed(2), loadedIndexTOW: +loadedIndexTOW.toFixed(2),
+    cgPercentMacZFW, cgPercentMacTakeoff, zfwInEnvelope, towInEnvelope,
+    pitchTrimDegrees, pitchTrimDirection
+  };
+}
+
+/* combined validity check driving Approve-blocking (Part D) */
+function lsValidate(ls, ref) {
+  const wt = computeWeightTotals(ls);
+  const lat = computeLoadAndTrim(ls, ref);
+  const issues = wt.exceedances.map(x => x.message);
+  if (!lat.zfwInEnvelope) issues.push(`Zero Fuel Weight CG (${lat.cgPercentMacZFW}% MAC) falls outside the certified envelope`);
+  if (!lat.towInEnvelope) issues.push(`Take-off CG (${lat.cgPercentMacTakeoff}% MAC) falls outside the certified envelope`);
+  return { ok: issues.length === 0, issues, weightTotals: wt, loadAndTrim: lat };
+}
+
 /* ═══ S3 — TURNAROUND DETAIL (key: turnaround) ══════════════ */
 function renderTurnaround(el) {
   let f = selectedFlightId ? getFlight(selectedFlightId) : null;
@@ -2362,6 +3430,28 @@ function renderTurnaround(el) {
   const ticks = f.actionTicks || [];
   const confChart = renderConfidenceChart(c, accent);
 
+  /* live elapsed-vs-buffer readout — sits inside the gauge card so the
+     prediction and reality are directly next to each other (Part C) */
+  let gaugeElapsedHtml = '';
+  let gaugeOverBuffer = false;
+  if (f.status === 'IN_BLOCK' && f.actualInBlock) {
+    const info = turnaroundElapsedInfo(f.actualInBlock, c.bufferMinutes);
+    gaugeOverBuffer = info.state === 'over';
+    gaugeElapsedHtml = `<div class="gauge-elapsed ge-${info.state}" data-since="${f.actualInBlock}" data-buffer="${c.bufferMinutes}">
+      <span class="ge-label">ELAPSED SINCE BLOCK-ON</span>
+      <span class="ge-time mono" data-ge-val>${mmss(info.elapsedMs)}</span>
+      <span class="ge-note" data-ge-note>${info.state === 'over' ? `Over buffer by ${info.overBy} min` : info.state === 'approaching' ? 'Approaching buffer' : 'Within buffer'}</span>
+    </div>`;
+  } else if (f.status === 'OFF_BLOCK' && f.actualInBlock && f.actualOffBlock) {
+    const totalMin = minutesBetween(f.actualOffBlock, f.actualInBlock);
+    const state = totalMin > c.bufferMinutes ? 'over' : (totalMin >= c.bufferMinutes * 0.85 ? 'approaching' : 'under');
+    gaugeElapsedHtml = `<div class="gauge-elapsed ge-${state}">
+      <span class="ge-label">ACTUAL TURNAROUND</span>
+      <span class="ge-time mono">${mmss(totalMin * 60000)}</span>
+      <span class="ge-note">${state === 'over' ? `Exceeded buffer by ${Math.round(totalMin - c.bufferMinutes)} min` : 'Completed within buffer'}</span>
+    </div>`;
+  }
+
   el.innerHTML = `
     <div class="turn-wrap">
       <!-- 1 HEADER WITH FLIGHT SELECTOR (mirrors the Flight Board) -->
@@ -2389,7 +3479,7 @@ function renderTurnaround(el) {
 
       <div class="turn-grid">
         <!-- 2 BUFFER GAUGE -->
-        <section class="card gauge-card">
+        <section class="card gauge-card${gaugeOverBuffer ? ' over-buffer' : ''}">
           <h3 class="card-h">Recommended buffer</h3>
           <div class="gauge">
             <svg viewBox="0 0 160 160">
@@ -2401,6 +3491,7 @@ function renderTurnaround(el) {
             <div class="gauge-center"><span class="gauge-num mono">${c.bufferMinutes}</span><span class="gauge-unit">min</span></div>
           </div>
           <p class="gauge-note">Base ${getActiveWeightVersion().params.baseBuffer} + risk allowance</p>
+          ${gaugeElapsedHtml}
         </section>
 
         <!-- 3 TOBT -->
@@ -2477,7 +3568,7 @@ function renderTurnaround(el) {
 
         <!-- 7 INPUTS & PROVENANCE -->
         <section class="card prov-card">
-          <h3 class="card-h">Inputs &amp; provenance</h3>
+          <h3 class="card-h">Inputs &amp; provenance${(getLoadsheetByFlight(f.id) && hasPermission('loadsheet')) ? `<button class="btn btn-ghost btn-sm" id="turn-view-loadsheet" type="button" style="margin-left:auto">View Loadsheet</button>` : ''}</h3>
           <table class="prov-tbl">
             <thead><tr><th>Variable</th><th>Value</th><th>Source</th><th>Time</th><th>Quality</th></tr></thead>
             <tbody>
@@ -2490,6 +3581,7 @@ function renderTurnaround(el) {
   }).join('')}
             </tbody>
           </table>
+          ${provFor(f, 3).quality === 'MEASURED' ? `<p class="prov-note">✓ Load factor confirmed via loadsheet.</p>` : ''}
         </section>
       </div>
 
@@ -2518,6 +3610,8 @@ function renderTurnaround(el) {
   /* animate gauge */
   const gf = el.querySelector('.gauge-fill');
   requestAnimationFrame(() => { gf.style.transition = 'stroke-dashoffset 1s var(--ease)'; gf.style.strokeDashoffset = gf.dataset.target; });
+
+  tickTurnaroundElapsed();
 
   /* flight selector — switches the ENTIRE Turnaround Detail (header,
      stand, EIBT/STD, aircraft, gauge, band, drivers, provenance …) to the
@@ -2555,6 +3649,9 @@ function renderTurnaround(el) {
     if (footText) footText.textContent = t.length === actions.length && actions.length ? '✓ All actions completed' : `${actions.length - t.length} remaining`;
   };
 
+  const viewLsBtn = el.querySelector('#turn-view-loadsheet');
+  if (viewLsBtn) viewLsBtn.onclick = () => { loadsheetSelectedFlightId = f.id; showModule('loadsheet'); };
+
   /* audit toggle + verify */
   const toggle = el.querySelector('#audit-toggle'), body = el.querySelector('#audit-body');
   toggle.onclick = () => { body.hidden = !body.hidden; toggle.classList.toggle('open', !body.hidden); };
@@ -2570,6 +3667,17 @@ function renderTurnaround(el) {
       : `<strong>✗ Mismatch.</strong> The re-run did not reproduce the stored result.`;
     logActivity({ action: 'verified reproducibility', target: f.flightNumber, category: 'audit', severity: match ? 'info' : 'danger' });
   };
+}
+
+/* live-refresh the gauge-card elapsed readout, matching tickBoardElapsed() */
+function tickTurnaroundElapsed() {
+  const box = document.querySelector('.gauge-elapsed[data-since]'); if (!box) return;
+  const info = turnaroundElapsedInfo(box.dataset.since, Number(box.dataset.buffer));
+  box.className = 'gauge-elapsed ge-' + info.state;
+  const val = box.querySelector('[data-ge-val]'); if (val) val.textContent = mmss(info.elapsedMs);
+  const note = box.querySelector('[data-ge-note]');
+  if (note) note.textContent = info.state === 'over' ? `Over buffer by ${info.overBy} min` : info.state === 'approaching' ? 'Approaching buffer' : 'Within buffer';
+  const card = box.closest('.gauge-card'); if (card) card.classList.toggle('over-buffer', info.state === 'over');
 }
 
 function emptyState(title, msg, iconPath) {
@@ -2641,7 +3749,7 @@ function renderGseEntry(el) {
   const fleet = getGse();
   const byType = {};
   fleet.forEach(u => {
-    (byType[u.typeCode] = byType[u.typeCode] || { code: u.typeCode, name: u.type, category: u.category || 'POWERED', gha: ghaOf(u), total: 0, avail: 0 });
+    (byType[u.typeCode] = byType[u.typeCode] || { code: u.typeCode, name: u.type, category: u.category || 'POWERED', ghaId: ghaOf(u), total: 0, avail: 0 });
   });
   fleet.forEach(u => {
     byType[u.typeCode].total++;
@@ -2651,9 +3759,10 @@ function renderGseEntry(el) {
   const s = getSession();
 
   /* operating Ground Handling Agents across the fleet */
+  const ghas = getGhas();
   const ghaGroups = {};
-  GHA_ORDER.forEach(id => ghaGroups[id] = { total: 0, svc: 0 });
-  fleet.filter(u => u.status !== 'RETIRED').forEach(u => { const id = ghaOf(u); (ghaGroups[id] = ghaGroups[id] || { total: 0, svc: 0 }); ghaGroups[id].total++; if (u.status === 'SERVICEABLE') ghaGroups[id].svc++; });
+  ghas.forEach(g => ghaGroups[g.id] = { total: 0, svc: 0 });
+  fleet.filter(u => u.status !== 'RETIRED').forEach(u => { const id = ghaOf(u); if (!id) return; (ghaGroups[id] = ghaGroups[id] || { total: 0, svc: 0 }); ghaGroups[id].total++; if (u.status === 'SERVICEABLE') ghaGroups[id].svc++; });
 
   const poweredCount = types.filter(t => t.category === 'POWERED').length;
   const nonPoweredCount = types.filter(t => t.category === 'NON_POWERED').length;
@@ -2670,7 +3779,7 @@ function renderGseEntry(el) {
   const summaryRatio = summaryTotal ? summaryAvail / summaryTotal : 0;
   const summaryPct = Math.round(summaryRatio * 100);
   const barColor = summaryRatio >= 0.7 ? 'var(--green)' : summaryRatio >= 0.45 ? 'var(--amber)' : 'var(--red)';
-  const badgeColor = summaryRatio >= 0.7 ? '#15803D' : summaryRatio >= 0.45 ? '#B45309' : '#991B1B';
+  const badgeColor = summaryRatio >= 0.7 ? '#15803D' : summaryRatio >= 0.45 ? '#92400E' : '#991B1B';
   const badgeBg = summaryRatio >= 0.7 ? 'var(--green-lite)' : summaryRatio >= 0.45 ? 'var(--amber-lite)' : 'var(--red-lite)';
   const catLabel = gseCatFilter === 'ALL' ? 'Total Fleet Availability' : (gseCatFilter === 'POWERED' ? 'Powered GSE Availability' : (gseCatFilter === 'NON_POWERED' ? 'Non-Powered Availability' : 'Infrastructure Availability'));
 
@@ -2702,14 +3811,14 @@ function renderGseEntry(el) {
       <!-- GROUND HANDLING AGENTS (MUX) -->
       <div class="gha-section">
         <div class="gha-head"><h3 class="card-h" style="margin:0">Ground Handling Agents · Multan (MUX)</h3>
-          <span class="gha-sub mono">${GHA_ORDER.filter(id => ghaGroups[id] && ghaGroups[id].total).length} agents operating this fleet</span></div>
+          <span class="gha-sub mono">${ghas.filter(g => ghaGroups[g.id] && ghaGroups[g.id].total).length} agents operating this fleet</span></div>
         <div class="gha-grid">
-          ${GHA_ORDER.filter(id => ghaGroups[id] && ghaGroups[id].total).map(id => { const g = GHAS[id]; const grp = ghaGroups[id];
+          ${ghas.filter(g => ghaGroups[g.id] && ghaGroups[g.id].total).map((g, i) => { const grp = ghaGroups[g.id]; const color = ghaColorFor(g.id);
             const pct = grp.total ? Math.round(grp.svc / grp.total * 100) : 0;
-            return `<div class="gha-card" style="--gha:${g.color}">
-              <div class="ghc-top"><span class="ghc-name">${escapeHtml(g.name)}</span><span class="gha-badge" style="--gha:${g.color}">${escapeHtml(g.short)}</span></div>
-              <div class="ghc-role">${escapeHtml(g.role)}</div>
-              <div class="ghc-carriers">${escapeHtml(g.carriers)}</div>
+            return `<div class="gha-card card-stagger" data-open-gha="${g.id}" style="--gha:${color};animation-delay:${i * 40}ms">
+              <div class="ghc-top"><span class="ghc-name">${escapeHtml(g.name)}</span><span class="gha-badge" style="--gha:${color}">${escapeHtml(g.code)}</span></div>
+              <div class="ghc-role">${escapeHtml(ghaOwnershipLabel(g.ownership))}</div>
+              <div class="ghc-carriers">${escapeHtml(ghaAirlinesLabel(g))}</div>
               <div class="ghc-foot"><span class="mono ghc-units">${grp.total} units</span><span class="ghc-bar"><span style="width:${pct}%"></span></span><span class="mono ghc-pct">${pct}% svc</span></div>
             </div>`; }).join('')}
         </div>
@@ -2730,7 +3839,7 @@ function renderGseEntry(el) {
             <div class="gr-top">
               <div class="gr-left">
                 <span class="gr-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${ICONS.gse}</svg></span>
-                <span class="gr-name">${escapeHtml(t.name)} ${ghaBadge(t.gha)}</span>
+                <span class="gr-name">${escapeHtml(t.name)} ${ghaBadge(t.ghaId)}${suitabilityInfoTitle(t.code) ? `<span class="gr-suit-info" title="${escapeHtml(suitabilityInfoTitle(t.code))}"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="7.7" r="1.1" fill="currentColor" stroke="none"/></svg></span>` : ''}</span>
               </div>
               <span class="gr-badge mono" data-badge>${t.avail} / ${t.total}</span>
             </div>
@@ -2787,7 +3896,7 @@ function renderGseEntry(el) {
     const pctEl = el.querySelector('#gt-pct-text');
     if (pctEl) {
       pctEl.textContent = `${pct}% Readiness`;
-      pctEl.style.color = ratio >= 0.7 ? '#15803D' : ratio >= 0.45 ? '#B45309' : '#991B1B';
+      pctEl.style.color = ratio >= 0.7 ? '#15803D' : ratio >= 0.45 ? '#92400E' : '#991B1B';
       pctEl.style.background = ratio >= 0.7 ? 'var(--green-lite)' : ratio >= 0.45 ? 'var(--amber-lite)' : 'var(--red-lite)';
     }
     const gf = el.querySelector('#gt-fill');
@@ -2804,6 +3913,10 @@ function renderGseEntry(el) {
       gseCatFilter = btn.dataset.cat;
       renderGseEntry(el);
     };
+  }
+  const ghaGridEl = el.querySelector('.gha-grid');
+  if (ghaGridEl && hasPermission('gha')) {
+    ghaGridEl.onclick = e => { const card = e.target.closest('[data-open-gha]'); if (card) openGhaDetail(card.dataset.openGha); };
   }
 
   el.querySelector('#gse-rows').onclick = e => {
@@ -2854,10 +3967,46 @@ function isoWithTime(baseIso, hhmmStr) {
 }
 const DELAY_REASONS = ['Late inbound aircraft', 'GSE unavailable', 'Crew shortage', 'Baggage handling', 'PRM assistance', 'Fuelling delay', 'ATC/slot', 'Weather', 'Other'];
 
+/* ── Block-On / Block-Off tab state (sibling of gseCatFilter/equipFilter) ── */
+let blockTab = null;   // 'blockon' | 'blockoff' — lazily defaulted, then sticky
+
+function defaultBlockTab() {
+  const NEAR_TERM_MIN = 30;
+  const near = getFlights().some(f => f.status === 'SCHEDULED' && Math.abs(minutesBetween(nowISO(), f.eibt)) <= NEAR_TERM_MIN);
+  return near ? 'blockon' : 'blockoff';
+}
+
+/* "Due in 12 min" (neutral) / "Overdue by 6 min" (amber) — ticks live */
+function dueLabel(eibtIso) {
+  const mins = minutesBetween(nowISO(), eibtIso);   // positive once EIBT is in the past
+  if (mins > 0) return { text: `Overdue by ${mins} min`, cls: 'over' };
+  const due = Math.abs(mins);
+  return { text: due === 0 ? 'Due now' : `Due in ${due} min`, cls: 'neutral' };
+}
+
+function tickBlockOnDue() {
+  document.querySelectorAll('.bo-due[data-eibt]').forEach(elx => {
+    const due = dueLabel(elx.dataset.eibt);
+    elx.textContent = due.text;
+    elx.classList.remove('bo-due-neutral', 'bo-due-over');
+    elx.classList.add('bo-due-' + due.cls);
+  });
+}
+
 function renderOffBlock(el) {
+  if (!blockTab) blockTab = defaultBlockTab();
+
+  const scheduled = getFlights().filter(f => f.status === 'SCHEDULED').sort((a, b) => new Date(a.eibt) - new Date(b.eibt));
   const pending = getFlights().filter(f => f.status === 'IN_BLOCK' && !f.actualOffBlock);
   const outcomes = getOutcomes();
   const recent = outcomes.slice(0, 8);
+
+  const overdueCount = scheduled.filter(f => minutesBetween(nowISO(), f.eibt) > 0).length;
+  const blockedOnToday = getFlights().filter(f => f.actualInBlock && isSameDay(f.actualInBlock)).length;
+  const onBlockVariances = getFlights().filter(f => f.inBlockVarianceMin != null).map(f => Math.abs(f.inBlockVarianceMin));
+  const avgOnBlockVar = onBlockVariances.length ? Math.round(onBlockVariances.reduce((a, b) => a + b, 0) / onBlockVariances.length) : 0;
+  const recentBlockOns = getFlights().filter(f => f.actualInBlock)
+    .sort((a, b) => new Date(b.actualInBlock) - new Date(a.actualInBlock)).slice(0, 8);
 
   const totalLogged = outcomes.length;
   const avgError = totalLogged ? Math.round(outcomes.reduce((s, o) => s + Math.abs(o.error), 0) / totalLogged) : 0;
@@ -2867,12 +4016,86 @@ function renderOffBlock(el) {
     <div class="mod-wide">
       <div class="mod-head">
         <div>
-          <h1 class="mod-title">Off-Block Logging</h1>
-          <p class="mod-sub">${pending.length} in-block flight${pending.length === 1 ? '' : 's'} awaiting actual off-block time (AOBT) confirmation</p>
+          <h1 class="mod-title">Block Times</h1>
+          <p class="mod-sub">${blockTab === 'blockon'
+      ? `${scheduled.length} scheduled arrival${scheduled.length === 1 ? '' : 's'} awaiting block-on`
+      : `${pending.length} in-block flight${pending.length === 1 ? '' : 's'} awaiting actual off-block time (AOBT) confirmation`}</p>
         </div>
       </div>
 
-      <!-- KPI STRIP -->
+      <div class="gse-cat-tabs" id="bt-tabs">
+        <button type="button" class="gct-tab ${blockTab === 'blockon' ? 'active' : ''}" data-tab="blockon">Block-On (${scheduled.length})</button>
+        <button type="button" class="gct-tab ${blockTab === 'blockoff' ? 'active' : ''}" data-tab="blockoff">Block-Off (${pending.length})</button>
+      </div>
+
+      ${blockTab === 'blockon' ? `
+      <!-- BLOCK-ON KPI STRIP -->
+      <div class="ob-kpi-strip">
+        <div class="kpi"><span class="kpi-num mono">${scheduled.length}</span><span class="kpi-lbl">Awaiting Block-On</span></div>
+        <div class="kpi"><span class="kpi-num mono">${overdueCount}</span><span class="kpi-lbl">Overdue</span></div>
+        <div class="kpi"><span class="kpi-num mono">${blockedOnToday}</span><span class="kpi-lbl">Blocked On Today</span></div>
+        <div class="kpi"><span class="kpi-num mono">±${avgOnBlockVar} <small style="font-size:12px;font-weight:500;color:var(--text-mute)">min</small></span><span class="kpi-lbl">Avg Block-On Variance</span></div>
+      </div>
+
+      <!-- 2-COLUMN DUAL PANE -->
+      <div class="ob-main-grid">
+        <!-- LEFT: Scheduled Arrivals -->
+        <section class="card ob-pending-card">
+          <h3 class="card-h">Scheduled Arrivals (${scheduled.length})</h3>
+          <div class="ob-list" id="bo-list">
+            ${scheduled.length ? scheduled.map(f => {
+        const due = dueLabel(f.eibt);
+        return `
+              <div class="ob-item card" data-flight="${f.id}">
+                <div class="ob-item-top">
+                  <span class="fl-num mono">${escapeHtml(f.flightNumber)}</span>
+                  <span class="bo-due bo-due-${due.cls} mono" data-eibt="${f.eibt}">${due.text}</span>
+                </div>
+                <div class="ob-item-meta">
+                  <strong>${formatStand(f.stand)}</strong> · Aircraft <strong>${escapeHtml(f.aircraftType)}</strong> · EIBT <strong class="mono">${hhmm(f.eibt)}</strong>
+                </div>
+                <div class="ob-item-tobt">
+                  <div class="tobt-box">
+                    <span class="ob-k">EXPECTED IN-BLOCK</span>
+                    <span class="mono ob-v">${hhmm(f.eibt)}</span>
+                  </div>
+                  <button class="btn btn-primary btn-sm" data-logon="${f.id}" type="button">Log Block-On</button>
+                </div>
+              </div>`;
+      }).join('') : emptyState('All caught up', 'No scheduled arrivals awaiting block-on.')}
+          </div>
+        </section>
+
+        <!-- RIGHT: Recent Block-Ons History Log -->
+        <section class="card ob-history-card">
+          <h3 class="card-h">Recent Block-Ons (${recentBlockOns.length})</h3>
+          ${recentBlockOns.length ? `
+          <div class="table-scroll">
+            <table class="prov-tbl ob-tbl">
+              <thead>
+                <tr>
+                  <th>Flight</th>
+                  <th>EIBT</th>
+                  <th>Blocked On</th>
+                  <th>Variance</th>
+                  <th>By</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${recentBlockOns.map(f => `
+                <tr>
+                  <td><strong class="mono">${escapeHtml(f.flightNumber)}</strong></td>
+                  <td class="mono">${hhmm(f.eibt)}</td>
+                  <td class="mono">${hhmm(f.actualInBlock)}</td>
+                  <td><span class="orc-err ${errorClass(f.inBlockVarianceMin)} mono">${f.inBlockVarianceMin === 0 ? 'on time' : fmtSigned(f.inBlockVarianceMin) + ' min'}</span></td>
+                  <td>${escapeHtml(f.inBlockLoggedBy || '—')}</td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>` : '<p class="rs-none">No block-ons logged yet.</p>'}
+        </section>
+      </div>` : `
+      <!-- BLOCK-OFF KPI STRIP -->
       <div class="ob-kpi-strip">
         <div class="kpi">
           <span class="kpi-num mono">${pending.length}</span>
@@ -2897,10 +4120,10 @@ function renderOffBlock(el) {
         <!-- LEFT: Pending Flights -->
         <section class="card ob-pending-card">
           <h3 class="card-h">Pending In-Block Flights (${pending.length})</h3>
-          <div class="ob-list">
+          <div class="ob-list" id="ob-list">
             ${pending.length ? pending.map(f => {
-    const c = f.calculation || calculateFlightRisk(f);
-    return `
+        const c = f.calculation || calculateFlightRisk(f);
+        return `
               <div class="ob-item card" data-flight="${f.id}">
                 <div class="ob-item-top">
                   <span class="fl-num mono">${escapeHtml(f.flightNumber)}</span>
@@ -2917,7 +4140,7 @@ function renderOffBlock(el) {
                   <button class="btn btn-primary btn-sm" data-log="${f.id}" type="button">Log off-block</button>
                 </div>
               </div>`;
-  }).join('') : emptyState('All caught up', 'No in-block flights are currently awaiting off-block confirmation.')}
+      }).join('') : emptyState('All caught up', 'No in-block flights are currently awaiting off-block confirmation.')}
           </div>
         </section>
 
@@ -2949,10 +4172,66 @@ function renderOffBlock(el) {
             </table>
           </div>` : '<p class="rs-none">No off-block outcomes logged yet.</p>'}
         </section>
-      </div>
+      </div>`}
     </div>`;
 
-  el.querySelector('.ob-list').onclick = e => { const b = e.target.closest('[data-log]'); if (b) openOffBlockModal(b.dataset.log); };
+  el.querySelector('#bt-tabs').onclick = e => {
+    const b = e.target.closest('[data-tab]'); if (!b || b.dataset.tab === blockTab) return;
+    blockTab = b.dataset.tab; renderOffBlock(el);
+  };
+
+  if (blockTab === 'blockon') {
+    el.querySelector('#bo-list').onclick = e => { const b = e.target.closest('[data-logon]'); if (b) openBlockOnModal(b.dataset.logon); };
+  } else {
+    el.querySelector('#ob-list').onclick = e => { const b = e.target.closest('[data-log]'); if (b) openOffBlockModal(b.dataset.log); };
+  }
+  tickBlockOnDue();
+}
+
+/* row exits the Block-On list the same way admin table rows exit —
+   .removing + rowOut — then the module re-renders onto the Block-Off side */
+function animateBlockOnExit(flightId) {
+  const row = document.querySelector(`.ob-item[data-flight="${flightId}"]`);
+  const finish = () => { if (currentModule === 'offblock') showModule('offblock'); };
+  if (row) { row.classList.add('removing'); setTimeout(finish, 350); } else finish();
+}
+
+function openBlockOnModal(flightId) {
+  const f = getFlight(flightId); if (!f) return;
+  const modal = openModal(`
+    <div class="modal-head"><div><h3>Log Block-On</h3><p>${escapeHtml(f.flightNumber)} · ${formatStand(f.stand)} · EIBT ${hhmm(f.eibt)}</p></div>
+      <button class="modal-x" data-x aria-label="Close"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6 L18 18 M18 6 L6 18"/></svg></button></div>
+    <div class="field"><label for="bo-time">Actual block-on time</label>
+      <div class="input-wrap"><input type="time" id="bo-time" value="${hhmm(nowISO())}"/></div></div>
+    <div class="ob-error" id="bo-error" hidden></div>
+    <div class="modal-foot"><button class="btn btn-ghost" data-x>Cancel</button><button class="btn btn-primary" id="bo-save">Save block-on</button></div>`);
+
+  modal.querySelectorAll('[data-x]').forEach(b => b.onclick = closeModal);
+  const timeEl = modal.querySelector('#bo-time');
+  const errEl = modal.querySelector('#bo-error');
+
+  function preview() {
+    const actualIso = isoWithTime(f.eibt, timeEl.value);
+    const variance = minutesBetween(actualIso, f.eibt);
+    const word = variance === 0 ? 'on time' : `${Math.abs(variance)} min ${variance > 0 ? 'late' : 'early'}`;
+    errEl.hidden = false;
+    errEl.className = 'ob-error ' + errorClass(variance);
+    errEl.innerHTML = `EIBT <strong class="mono">${hhmm(f.eibt)}</strong> → logging <strong class="mono">${hhmm(actualIso)}</strong> = <strong class="mono">${word}</strong>`;
+    return { actualIso, variance, word };
+  }
+  preview();
+  timeEl.oninput = preview;
+
+  modal.querySelector('#bo-save').onclick = () => {
+    const { actualIso, variance, word } = preview();
+    const loggedBy = currentActor();
+    updateFlight(f.id, { status: 'IN_BLOCK', actualInBlock: actualIso, inBlockLoggedBy: loggedBy, inBlockVarianceMin: variance });
+    logActivity({ action: `logged block-on (${word})`, target: f.flightNumber, category: 'offblock', severity: Math.abs(variance) > 15 ? 'warn' : 'success' });
+    closeModal();
+    showToast(`${f.flightNumber} blocked on · ${word}`, Math.abs(variance) <= 5 ? 'success' : 'notice');
+    updateAlertBadge();
+    animateBlockOnExit(f.id);
+  };
 }
 
 function openOffBlockModal(flightId) {
@@ -3051,7 +4330,17 @@ function unitFailureProb(u) {
 }
 function activeFleet() { return getGse().filter(u => u.status !== 'RETIRED'); }
 function fleetGseRatio() { const f = activeFleet(); return { avail: f.filter(u => u.status === 'SERVICEABLE').length, total: f.length }; }
-function fleetAvgFailure() { const f = activeFleet(); return f.length ? f.reduce((a, u) => a + unitFailureProb(u), 0) / f.length : 0.3; }
+function fleetAvgFailure() {
+  const f = activeFleet();
+  let avg = f.length ? f.reduce((a, u) => a + unitFailureProb(u), 0) / f.length : 0.3;
+  // Fleet performance adjustment: aging fleet increases aggregate failure probability
+  const avgPerf = avgFleetPerfScore();
+  if (avgPerf < 60) {
+    const adj = ((60 - avgPerf) / 25) * 0.05; // linear 0→0.05 as score drops from 60→35
+    avg = ENGINE.clamp(avg + adj, 0, 1);
+  }
+  return avg;
+}
 function applyFleetToFlight(f) { const g = fleetGseRatio(); f.rawInputs.gseAvailable = g.avail; f.rawInputs.gseTotal = g.total; f.rawInputs.mtbfFailureProb = +fleetAvgFailure().toFixed(2); }
 
 /* donut chart (hand-built SVG) */
@@ -3086,6 +4375,16 @@ function renderManager(el) {
   const alerts = getAlerts().filter(a => !isRep || flights.some(f => f.id === a.flightId));
   const acked = alerts.filter(a => a.stage === 'ACKNOWLEDGED').length;
   const escalated = alerts.filter(a => a.stage === 'ESCALATED' || a.stage === 'UNACK_CRITICAL').length;
+  const ghaWarnings = hasPermission('gha') ? ghasBelowMinimum() : [];
+  const certCounts = hasPermission('gha') ? (() => {
+    const activeGhas = getGhas().filter(g => g.status === 'ACTIVE');
+    let certified = 0, atRisk = 0;
+    activeGhas.forEach(g => {
+      const cert = currentGhoCertificate(g.id);
+      if (cert && cert.status === 'ISSUED') certified++; else if (cert && cert.status === 'AT_RISK') atRisk++;
+    });
+    return { certified, atRisk, notCertified: activeGhas.length - certified - atRisk };
+  })() : null;
 
   const weekAgo = Date.now() - 7 * 864e5;
   const recentOc = getOutcomes().filter(o => new Date(o.loggedAt) >= weekAgo && o.dataQuality === 'GOOD');
@@ -3108,6 +4407,12 @@ function renderManager(el) {
 
   const outstanding = alerts.filter(a => a.stage !== 'ACKNOWLEDGED');
 
+  /* Part C — lifecycle status distribution + any turnaround running over buffer */
+  const statusCounts = { SCHEDULED: 0, IN_BLOCK: 0, OFF_BLOCK: 0 };
+  flights.forEach(f => { if (statusCounts[f.status] !== undefined) statusCounts[f.status]++; });
+  const overBufferFlights = flights.filter(f => f.status === 'IN_BLOCK' && f.actualInBlock
+    && turnaroundElapsedInfo(f.actualInBlock, f.calculation.bufferMinutes).state === 'over');
+
   el.innerHTML = `
     <div class="mod-wide">
       <div class="mod-head">
@@ -3122,6 +4427,10 @@ function renderManager(el) {
         <div class="kpi"><span class="kpi-num mono" data-count="${avgBuffer}" data-suffix=" min">0</span><span class="kpi-lbl">Avg buffer</span></div>
         <div class="kpi"><span class="kpi-num mono">${acked}<span class="kpi-sep">/</span>${escalated}</span><span class="kpi-lbl">Ack / escalated</span></div>
         <div class="kpi"><span class="kpi-num mono" data-count="${mae7}" data-suffix=" min" data-dec="1">0</span><span class="kpi-lbl">MAE · 7 days</span></div>
+        ${certCounts ? `<div class="kpi kpi-clickable" id="kpi-gho" title="View GHO Registry">
+          <span class="kpi-num mono">${certCounts.certified}<span class="kpi-sep">/</span>${certCounts.atRisk}<span class="kpi-sep">/</span>${certCounts.notCertified}</span>
+          <span class="kpi-lbl">Certified / At risk / Not certified</span>
+        </div>` : ''}
       </div>
 
       <!-- ESCALATED / UNACK PANEL -->
@@ -3130,6 +4439,31 @@ function renderManager(el) {
         <div id="esc-body">${escBodyHtml(outstanding)}</div>
         <p class="esc-note mono">Demo timers compressed · stages (SMS → escalation → critical) preserved</p>
       </section>
+
+      <!-- TURNAROUND STATUS PANEL (Part C — reuses .esc-panel/.esc-row) -->
+      <section class="card esc-panel ${overBufferFlights.length ? 'has' : ''}" id="status-panel">
+        <h3 class="card-h">Turnaround status</h3>
+        <div class="status-counts mono">
+          <span><strong>${statusCounts.SCHEDULED}</strong> Scheduled</span>
+          <span><strong>${statusCounts.IN_BLOCK}</strong> In-block</span>
+          <span><strong>${statusCounts.OFF_BLOCK}</strong> Off-block</span>
+        </div>
+        <div id="status-body">${overBufferFlights.length ? overBufferFlights.map(f => {
+          const info = turnaroundElapsedInfo(f.actualInBlock, f.calculation.bufferMinutes);
+          return `<div class="esc-row r-RED">
+            <span class="esc-fl mono">${escapeHtml(f.flightNumber)}</span>
+            <span class="esc-stage stage-ESCALATED">OVER BUFFER</span>
+            <span class="esc-time mono" data-mgr-elapsed data-since="${f.actualInBlock}">${mmss(info.elapsedMs)}</span>
+            <span class="esc-lbl">elapsed · over by ${info.overBy} min</span></div>`;
+        }).join('') : '<div class="esc-empty">✓ All in-block turnarounds within buffer.</div>'}</div>
+      </section>
+
+      ${hasPermission('gha') ? `
+      <!-- GHA PERFORMANCE PANEL (reuses .esc-panel/.esc-row) -->
+      <section class="card esc-panel ${ghaWarnings.length ? 'has' : ''}" id="gha-warn-panel">
+        <h3 class="card-h">GHA performance</h3>
+        <div id="gha-warn-body">${ghaWarnings.length ? ghaWarnings.map(w => ghaWarningLineHtml(w)).join('') : '<div class="esc-empty">✓ All ground handling agents at or above minimum performance.</div>'}</div>
+      </section>` : ''}
 
       <div class="mgr-grid">
         <!-- RISK DISTRIBUTION -->
@@ -3151,12 +4485,23 @@ function renderManager(el) {
       <!-- FLIGHT TABLE -->
       <section class="card"><h3 class="card-h">Flights</h3>
         <div class="table-scroll"><table class="mgr-tbl">
-          <thead><tr><th>Flight</th><th>Stand</th><th>EIBT</th><th>Buffer</th><th>TOBT</th><th>Risk</th><th>Ack</th></tr></thead>
-          <tbody>${flights.slice().sort((a, b) => new Date(a.eibt) - new Date(b.eibt)).map(f => `
+          <thead><tr><th>Flight</th><th>Stand</th><th>EIBT</th><th>Buffer</th><th>TOBT</th><th>Risk</th><th>Turnaround</th><th>Ack</th></tr></thead>
+          <tbody>${flights.slice().sort((a, b) => new Date(a.eibt) - new Date(b.eibt)).map(f => {
+            let turnCell = '<span class="mono" style="color:var(--text-mute)">Scheduled</span>';
+            if (f.status === 'IN_BLOCK' && f.actualInBlock) {
+              const info = turnaroundElapsedInfo(f.actualInBlock, f.calculation.bufferMinutes);
+              const cls = info.state === 'over' ? 'bad' : info.state === 'approaching' ? 'warn' : 'good';
+              turnCell = `<span class="orc-err ${cls} mono"><span data-mgr-elapsed data-since="${f.actualInBlock}">${mmss(info.elapsedMs)}</span> elapsed</span>`;
+            } else if (f.status === 'OFF_BLOCK') {
+              turnCell = `<span class="mono" style="color:var(--text-mute)">Departed ${hhmm(f.actualOffBlock)}</span>`;
+            }
+            return `
             <tr><td class="mono">${escapeHtml(f.flightNumber)}</td><td>${f.stand}</td><td class="mono">${hhmm(f.eibt)}</td>
               <td class="mono">${f.calculation.bufferMinutes} min</td><td class="mono">${hhmm(f.calculation.tobt)}</td>
               <td>${riskChip(f.calculation.riskLevel)}</td>
-              <td>${f.calculation.riskLevel === 'GREEN' ? '—' : f.ackStatus === 'ACKNOWLEDGED' ? '<span class="ack-yes">✓ Ack</span>' : '<span class="ack-no">Pending</span>'}</td></tr>`).join('')}
+              <td>${turnCell}</td>
+              <td>${f.calculation.riskLevel === 'GREEN' ? '—' : f.ackStatus === 'ACKNOWLEDGED' ? '<span class="ack-yes">✓ Ack</span>' : '<span class="ack-no">Pending</span>'}</td></tr>`;
+          }).join('')}
           </tbody></table></div>
       </section>
 
@@ -3213,6 +4558,17 @@ function renderManager(el) {
   });
 
   if (!isRep) el.querySelectorAll('[data-feed]').forEach(b => b.onclick = () => toggleIntegration(b.dataset.feed));
+
+  const ghaWarnBody = el.querySelector('#gha-warn-body');
+  if (ghaWarnBody) ghaWarnBody.onclick = e => {
+    const row = e.target.closest('[data-gha-id]'); if (!row) return;
+    ghaDetailTab = 'performance';
+    showModule('gha');
+    openGhaDetail(row.dataset.ghaId);
+  };
+
+  const kpiGho = el.querySelector('#kpi-gho');
+  if (kpiGho) kpiGho.onclick = () => { ghaModuleTab = 'registry'; showModule('gha'); };
 }
 
 function escBodyHtml(outstanding) {
@@ -3231,6 +4587,9 @@ function escBodyHtml(outstanding) {
 function tickManagerLive() {
   document.querySelectorAll('.esc-time[data-created]').forEach(el => {
     el.textContent = mmss(Date.now() - new Date(el.dataset.created));
+  });
+  document.querySelectorAll('[data-mgr-elapsed]').forEach(el => {
+    el.textContent = mmss(Date.now() - new Date(el.dataset.since));
   });
 }
 
@@ -3257,16 +4616,10 @@ function bufferTimelineSVG(flights) {
 /* ═══ S7 — EQUIPMENT REGISTER (key: equipment) ══════════════ */
 /* ═══ Ground Handling Agents (GHAs) — Multan · MUX ═════════════
    Each GSE unit is operated by one of the station's ground handling
-   agents (or the airport authority for safety/fixed infrastructure). */
-const GHAS = {
-  DNATA: { name: "Gerry's dnata",              short: 'dnata',         role: 'International passenger, ramp & baggage', carriers: 'Qatar Airways · flydubai · Air Arabia · Saudia · SalamAir', color: '#2563EB' },
-  PIA:   { name: 'PIA Ground Handling (PIAC)', short: 'PIA GH',        role: 'PIA ramp, baggage & turnaround',         carriers: 'PIA domestic & international · charter operators',           color: '#16A34A' },
-  SAPS:  { name: 'Shaheen Airport Services',   short: 'SAPS',          role: 'Cargo, freighter & charter support',      carriers: 'Cargo handling · freighter flights · private/charter',       color: '#D97706' },
-  RAS:   { name: 'Royal Airport Services',     short: 'RAS',           role: 'Domestic charter & apron support',        carriers: 'Domestic charter · commercial passenger support',            color: '#7C3AED' },
-  AUTH:  { name: 'Airport Authority (MUX)',    short: 'MUX Authority', role: 'Safety, rescue & fixed infrastructure',   carriers: 'Station-owned — not a commercial GHA',                       color: '#64748B' }
-};
-const GHA_ORDER = ['DNATA', 'PIA', 'SAPS', 'RAS', 'AUTH'];
-/* which agent operates each equipment type by default */
+   agents (or the airport authority for safety/fixed infrastructure).
+   The agents themselves are a real entity in `orbis_ghas` (see the GHA
+   Management module below) — GSE units reference one by `ghaId`. */
+/* which agent operates each equipment type by default, at seed time only */
 const GHA_BY_TYPE = {
   TUG: 'DNATA', TLT: 'DNATA', PBS: 'DNATA', CAT: 'DNATA', AMB: 'DNATA', PCA: 'DNATA', ASU: 'DNATA',
   BL: 'PIA', BT: 'PIA', GPU: 'PIA', PWT: 'PIA', LST: 'PIA', BCD: 'PIA',
@@ -3274,32 +4627,843 @@ const GHA_BY_TYPE = {
   DCT: 'RAS', SWP: 'RAS', CHK: 'RAS', CNS: 'RAS', MSH: 'RAS', JCK: 'RAS', COV: 'RAS',
   RFF: 'AUTH', BCV: 'AUTH', PBB: 'AUTH', FHS: 'AUTH'
 };
-function ghaOf(u) { return (u && u.gha && GHAS[u.gha]) ? u.gha : (GHA_BY_TYPE[u && u.typeCode] || 'AUTH'); }
-function ghaShort(id) { return (GHAS[id] || GHAS.AUTH).short; }
-function ghaBadge(id) { const g = GHAS[id] || GHAS.AUTH; return `<span class="gha-badge" style="--gha:${g.color}">${escapeHtml(g.short)}</span>`; }
+/* deterministic per-agent accent colour, by insertion order in orbis_ghas —
+   the 5 seeded agents land on exactly their original hand-picked colours;
+   any agent added later gets the next colour in the cycle */
+const GHA_PALETTE = ['#2563EB', '#16A34A', '#D97706', '#7C3AED', '#64748B', '#DB2777', '#0891B2', '#EA580C'];
+function ghaColorFor(id) {
+  if (!id) return '#94A3B8';
+  const idx = getGhas().findIndex(g => g.id === id);
+  return GHA_PALETTE[(idx >= 0 ? idx : 0) % GHA_PALETTE.length];
+}
+function ghaOf(u) { return (u && u.ghaId) || null; }
+function ghaShort(id) { const g = getGha(id); return g ? g.code : 'Unassigned'; }
+function ghaBadge(id) {
+  const g = getGha(id);
+  return `<span class="gha-badge" style="--gha:${ghaColorFor(id)}">${escapeHtml(g ? g.code : 'Unassigned')}</span>`;
+}
+function ghaOwnershipLabel(ownership) { return ownership === 'AIRPORT_SUBSIDIARY' ? 'Airport-owned & operated' : 'Private ground handler'; }
+function ghaAirlinesLabel(g) { return (g.airlinesServed && g.airlinesServed.length) ? g.airlinesServed.join(' · ') : 'No scheduled airlines'; }
+/* shared contract-expiry read — 'ok' / 'expiring' (<=90d) / 'expired' (<0d) */
+function ghaContractState(g) {
+  const daysLeft = Math.floor((new Date(g.contractEnd).getTime() - Date.now()) / 864e5);
+  const state = daysLeft < 0 ? 'expired' : daysLeft <= 90 ? 'expiring' : 'ok';
+  return { state, daysLeft };
+}
+function ghaFleetBreakdown(id) {
+  const units = getGse().filter(u => u.ghaId === id);
+  const cats = { POWERED: 0, NON_POWERED: 0, INFRASTRUCTURE: 0 };
+  units.forEach(u => { cats[u.category] = (cats[u.category] || 0) + 1; });
+  return { units, cats, total: units.length };
+}
 
-let equipFilter = { q: '', type: 'ALL', status: 'ALL', gha: 'ALL' };
-function renderEquipment(el) {
+/* ═══ GHA PERFORMANCE SCORING ENGINE ════════════════════════
+   Pure functions only — no DOM access, same discipline as the flight-risk
+   ENGINE above. computeGhaPerformance() reads the CURRENT live orbis_gse /
+   orbis_ghas / orbis_flights snapshot (this prototype tracks no per-day
+   status history, so serviceability is a current-snapshot approximation,
+   same as the deployment/fuel figures which are inherently "this month"
+   fields on the equipment record). Historical months in Part C are
+   synthesised by feeding plausible period-appropriate input figures through
+   these exact same functions — the math is always real, only the inputs
+   for past periods are constructed rather than read live. */
+
+/* typical litres/hour per equipment type — the fuel-efficiency benchmark.
+   Single source of truth: the equipment seed's TYPE_FIN.lph pulls from here
+   too, so the benchmark used to grade a unit is the same one used to seed
+   its "normal" consumption. */
+const GSE_FUEL_BENCHMARK = {
+  TUG: 9, TLT: 14, BL: 4, BT: 3.5, CL: 11, GPU: 2.5, ASU: 8, PCA: 6,
+  FLT: 10, PWT: 5, LST: 5, DCT: 16, CAT: 9, PBS: 4, AMB: 8, FLK: 4,
+  SWP: 11, RFF: 28, BCV: 4
+};
+
+/* ── period helpers ('YYYY-MM' strings) ── */
+function currentPeriod() { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; }
+function shiftPeriod(period, deltaMonths) {
+  const [y, m] = period.split('-').map(Number);
+  const d = new Date(y, m - 1 + deltaMonths, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+function previousPeriod(period) { return shiftPeriod(period, -1); }
+function last6Periods(endPeriod) { const end = endPeriod || currentPeriod(); return [-5, -4, -3, -2, -1, 0].map(d => shiftPeriod(end, d)); }
+function periodLabel(period) { const [y, m] = period.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' }); }
+function daysInMonth(period) { const [y, m] = period.split('-').map(Number); return new Date(y, m, 0).getDate(); }
+/* days to measure deployment capacity against: full month if it's already
+   elapsed, days-so-far if it's the current month — same reference the
+   Equipment Register's utilisation bar uses */
+function referenceDaysForPeriod(period) { return period === currentPeriod() ? new Date().getDate() : daysInMonth(period); }
+
+/* ── B1-B5: pure scoring math ── */
+const GHA_PERF = {
+  deploymentScore(hoursAchieved, hoursCapacity) {
+    if (hoursCapacity <= 0) return 100;
+    return Math.round(ENGINE.clamp(hoursAchieved / hoursCapacity, 0, 1) * 100);
+  },
+  serviceabilityScore(serviceableCount, totalCount) {
+    if (totalCount <= 0) return 100;
+    return Math.round(ENGINE.clamp(serviceableCount / totalCount, 0, 1) * 100);
+  },
+  suitabilityScore(typesCovered, typesRequired) {
+    if (typesRequired <= 0) return 100;
+    return Math.round(ENGINE.clamp(typesCovered / typesRequired, 0, 1) * 100);
+  },
+  /* 100 at-or-under the benchmark rate, linear falloff to 0 at 2x benchmark */
+  fuelEfficiencyScore(actualRate, benchmarkRate) {
+    if (benchmarkRate <= 0) return 100;
+    const ratio = actualRate / benchmarkRate;
+    if (ratio <= 1) return 100;
+    return Math.round(ENGINE.clamp(100 - (ratio - 1) * 100, 0, 100));
+  },
+  overallScore(metrics, weights) {
+    return Math.round(
+      metrics.deployment * weights.deployment + metrics.serviceability * weights.serviceability +
+      metrics.suitability * weights.suitability + metrics.fuelEfficiency * weights.fuelEfficiency
+    );
+  }
+};
+
+/* which aircraft types a GHA actually needs to cover, cross-referenced from
+   the airlines it serves against real flights on the board */
+function requiredAircraftTypesForGha(gha) {
+  if (!gha || !gha.airlinesServed || !gha.airlinesServed.length) return [];
+  const types = new Set();
+  const flights = getFlights();
+  gha.airlinesServed.forEach(code => flights.filter(f => f.airline === code).forEach(f => { if (f.aircraftType) types.add(f.aircraftType); }));
+  return [...types];
+}
+function suitabilityCoverage(ghaId, requiredTypes) {
+  const units = getGse().filter(u => u.ghaId === ghaId && u.status === 'SERVICEABLE');
+  const coveredTypes = requiredTypes.filter(t => units.some(u => { const sf = u.suitableFor || ['ALL']; return sf.includes('ALL') || sf.includes(t); }));
+  return { covered: coveredTypes.length, required: requiredTypes.length, coveredTypes };
+}
+function ghaMetricLabel(key) { return { deployment: 'Deployment', serviceability: 'Serviceability', suitability: 'Suitability', fuelEfficiency: 'Fuel Efficiency' }[key] || key; }
+function ghaWeakestMetric(metrics) {
+  let weakestKey = 'deployment';
+  Object.keys(metrics).forEach(k => { if (metrics[k] < metrics[weakestKey]) weakestKey = k; });
+  return { key: weakestKey, label: ghaMetricLabel(weakestKey), score: metrics[weakestKey] };
+}
+/* green ≥ threshold+10, amber within 10 points of threshold, red below threshold */
+function ghaScoreTier(score, threshold) {
+  if (score < threshold) return 'red';
+  if (score < threshold + 10) return 'amber';
+  return 'green';
+}
+
+/* compute one GHA's scorecard for a period from the CURRENT live fleet
+   snapshot (see file-header note above on the current-snapshot approach) */
+function computeGhaPerformance(ghaId, period) {
+  const gha = getGha(ghaId);
+  const units = getGse().filter(u => u.ghaId === ghaId && u.status !== 'RETIRED');
+  const config = getActiveGhaPerfConfig();
+
+  const refDays = referenceDaysForPeriod(period);
+  const hoursCapacity = units.length * refDays * 8;
+  const hoursAchieved = units.reduce((s, u) => s + ((u.nonFinancial && u.nonFinancial.deploymentHoursThisMonth) || 0), 0);
+  const deployment = GHA_PERF.deploymentScore(hoursAchieved, hoursCapacity);
+
+  const serviceableCount = units.filter(u => u.status === 'SERVICEABLE').length;
+  const statusRatio = GHA_PERF.serviceabilityScore(serviceableCount, units.length);
+  const svcUnits = units.filter(u => u.status === 'SERVICEABLE');
+  const avgPerfOfSvc = svcUnits.length
+    ? Math.round(svcUnits.reduce((s, u) => s + ((u.nonFinancial && u.nonFinancial.performanceScore && u.nonFinancial.performanceScore.finalScore) || 50), 0) / svcUnits.length)
+    : 50;
+  const serviceability = Math.round(0.80 * statusRatio + 0.20 * avgPerfOfSvc);
+
+  const requiredTypes = requiredAircraftTypesForGha(gha);
+  const cov = suitabilityCoverage(ghaId, requiredTypes);
+  const suitability = GHA_PERF.suitabilityScore(cov.covered, cov.required);
+
+  const powered = units.filter(u => u.category === 'POWERED');
+  let fuelScoreSum = 0; const fuelRatios = [];
+  powered.forEach(u => {
+    const f = u.financial || {};
+    const hrs = (u.nonFinancial && u.nonFinancial.deploymentHoursThisMonth) || 0;
+    if (f.fuelType !== 'DIESEL' || hrs <= 0) { fuelScoreSum += 100; return; }
+    const lph = GSE_FUEL_BENCHMARK[u.typeCode] || 6;
+    const actualRate = ((u.nonFinancial && u.nonFinancial.fuelConsumptionThisMonth) || 0) / hrs;
+    fuelRatios.push(actualRate / lph);
+    fuelScoreSum += GHA_PERF.fuelEfficiencyScore(actualRate, lph);
+  });
+  const fuelEfficiency = powered.length ? Math.round(fuelScoreSum / powered.length) : 100;
+  const fuelAvgRatioPct = fuelRatios.length ? Math.round((fuelRatios.reduce((a, b) => a + b, 0) / fuelRatios.length - 1) * 100) : null;
+
+  const metrics = { deployment, serviceability, suitability, fuelEfficiency };
+  const weights = config.params.metricWeights;
+  const overallScore = GHA_PERF.overallScore(metrics, weights);
+  const belowMinimum = overallScore < config.params.minimumThreshold;
+
+  return {
+    ghaId, period, metrics, overallScore, belowMinimum, computedAt: nowISO(),
+    detail: {
+      deployment: `${hoursAchieved} of ${hoursCapacity} possible hours`,
+      serviceability: `${serviceableCount} of ${units.length} svc (status ${statusRatio}% · avg perf ${avgPerfOfSvc}% → blend ${serviceability}%)`,
+      suitability: cov.required ? `${cov.covered} of ${cov.required} required types covered` : 'No airlines served — nothing required',
+      fuelEfficiency: fuelAvgRatioPct == null ? 'No diesel fuel usage recorded' : (fuelAvgRatioPct <= 0 ? `${Math.abs(fuelAvgRatioPct)}% under benchmark` : `${fuelAvgRatioPct}% above benchmark`)
+    }
+  };
+}
+
+/* upsert one record (by ghaId+period) and, only when explicitly asked to
+   log, record a single activity entry the moment a GHA newly crosses below
+   minimum relative to the PRIOR month — never re-logged on re-renders, and
+   de-duplicated so repeat recomputes in the same month don't spam the feed */
+function upsertGhaPerfRecord(result, opts) {
+  const doLog = !!(opts && opts.log);
+  const records = getGhaPerfRecords();
+  const existingIdx = records.findIndex(r => r.ghaId === result.ghaId && r.period === result.period);
+  const record = Object.assign({ id: existingIdx >= 0 ? records[existingIdx].id : uid('gp') }, result);
+  if (existingIdx >= 0) records[existingIdx] = record; else records.push(record);
+  saveGhaPerfRecords(records);
+
+  if (doLog && record.belowMinimum) {
+    const prev = getGhaPerfRecord(record.ghaId, previousPeriod(record.period));
+    const wasAboveBefore = !prev || !prev.belowMinimum;
+    const gha = getGha(record.ghaId);
+    const alreadyLogged = gha && getActivity().some(a => a.category === 'gha-performance' && a.target === gha.name && a.action.includes(record.period));
+    if (wasAboveBefore && gha && !alreadyLogged) {
+      const weak = ghaWeakestMetric(record.metrics);
+      logActivity({
+        action: `fell below minimum performance for ${periodLabel(record.period)} — driven by low ${weak.label.toLowerCase()} (${weak.score}%)`,
+        target: gha.name, category: 'gha-performance', severity: 'warn'
+      });
+    }
+  }
+  return record;
+}
+
+/* recompute every active GHA for the current month; called once after
+   history is seeded, and again after any config save so the effect is
+   immediately visible */
+function recomputeAllGhaPerformance(opts) {
+  const log = !opts || opts.log !== false;
+  const period = currentPeriod();
+  return getGhas().filter(g => g.status === 'ACTIVE').map(g => upsertGhaPerfRecord(computeGhaPerformance(g.id, period), { log }));
+}
+
+/* ═══ EQUIPMENT AGE-BASED PERFORMANCE SCORING ENGINE ════════
+   Pure function, no DOM access — same discipline as the risk
+   engine and GHA performance scoring. Computes a 0-100 score
+   from age decay, maintenance bonus, and reactivation penalty. */
+
+function computeEquipmentPerformanceScore(unit, config) {
+  const fin = unit.financial || {};
+  const acqDate = fin.acquisitionDate ? new Date(fin.acquisitionDate) : new Date();
+  const ageYears = Math.max(0, (Date.now() - acqDate.getTime()) / (365.25 * 864e5));
+  const curve = (config.perCategoryCurves || {})[unit.category] || { yearlyDeclinePercent: 8, floorPercent: 35 };
+  const floor = curve.floorPercent;
+
+  // B1: base age decay
+  const baseFromAge = Math.max(floor, 100 - (ageYears * curve.yearlyDeclinePercent));
+  let score = baseFromAge;
+
+  // B2: maintenance bonus — any maintLog entry within last 90 days
+  const now = Date.now();
+  const d90 = 90 * 864e5;
+  const log = unit.maintLog || [];
+  const hasRecentMaint = log.some(e => (now - new Date(e.date).getTime()) < d90);
+  let maintenanceBonusApplied = false;
+  if (hasRecentMaint) {
+    score = Math.min(100, score + config.maintenanceBonusPercent);
+    maintenanceBonusApplied = true;
+  }
+
+  // B3: reactivation penalty — unit is SERVICEABLE now and has a
+  //     maintLog entry within last 30 days with repair/corrective keywords
+  //     or a log entry type containing 'repair', 'corrective', 'overhaul',
+  //     'reactivat' suggesting it was recently brought back into service
+  const d30 = 30 * 864e5;
+  const reactivationKeywords = ['repair', 'corrective', 'overhaul', 'reactivat', 'restored', 'fixed'];
+  let reactivationPenaltyApplied = false;
+  if (unit.status === 'SERVICEABLE') {
+    const hasRecentReactivation = log.some(e => {
+      const age = now - new Date(e.date).getTime();
+      if (age > d30) return false;
+      const txt = ((e.type || '') + ' ' + (e.notes || '')).toLowerCase();
+      return reactivationKeywords.some(kw => txt.includes(kw));
+    });
+    if (hasRecentReactivation) {
+      score = Math.max(floor, score - config.reactivationPenaltyPercent);
+      reactivationPenaltyApplied = true;
+    }
+  }
+
+  // B4: final score
+  const finalScore = Math.round(ENGINE.clamp(score, floor, 100));
+
+  return {
+    finalScore, ageYears: +ageYears.toFixed(1), baseFromAge: Math.round(baseFromAge),
+    maintenanceBonusApplied, reactivationPenaltyApplied,
+    category: unit.category, curveUsed: curve
+  };
+}
+
+function recomputeAllEquipmentScores() {
   const fleet = getGse();
-  const active = fleet.filter(u => u.status !== 'RETIRED');
-  const svcPct = active.length ? Math.round(active.filter(u => u.status === 'SERVICEABLE').length / active.length * 100) : 0;
-  const inMaint = active.filter(u => u.status === 'MAINTENANCE').length;
-  const overdue = active.filter(u => new Date(u.nextServiceDue) < new Date()).length;
-  const types = [...new Set(fleet.map(u => u.type))];
+  const config = getActiveEquipPerfConfig().params;
+  fleet.forEach(u => {
+    u.nonFinancial = u.nonFinancial || {};
+    u.nonFinancial.performanceScore = computeEquipmentPerformanceScore(u, config);
+  });
+  saveGse(fleet);
+}
 
-  /* group active fleet by operating GHA */
-  const ghaGroups = {};
-  GHA_ORDER.forEach(id => ghaGroups[id] = { total: 0, svc: 0 });
-  active.forEach(u => { const id = ghaOf(u); (ghaGroups[id] = ghaGroups[id] || { total: 0, svc: 0 }); ghaGroups[id].total++; if (u.status === 'SERVICEABLE') ghaGroups[id].svc++; });
+function avgFleetPerfScore(ghaId) {
+  let fleet = getGse().filter(u => u.status !== 'RETIRED');
+  if (ghaId) fleet = fleet.filter(u => ghaOf(u) === ghaId);
+  if (!fleet.length) return 0;
+  return Math.round(fleet.reduce((s, u) => {
+    const ps = u.nonFinancial && u.nonFinancial.performanceScore;
+    return s + (ps ? ps.finalScore : 50);
+  }, 0) / fleet.length);
+}
 
+function unitsNearFloor(ghaId) {
+  const config = getActiveEquipPerfConfig().params;
+  let fleet = getGse();
+  if (ghaId) fleet = fleet.filter(u => ghaOf(u) === ghaId);
+  return fleet.filter(u => {
+    if (u.status === 'RETIRED') return false;
+    const ps = u.nonFinancial && u.nonFinancial.performanceScore;
+    if (!ps) return false;
+    const curve = (config.perCategoryCurves || {})[u.category];
+    if (!curve) return false;
+    return ps.finalScore <= curve.floorPercent + 5;
+  });
+}
+
+/* ═══ GHO CERTIFICATION EVALUATION (pure functions, no DOM access) ══
+   Reads orbis_gha_performance — never recomputes or duplicates the scoring
+   logic above, only evaluates already-computed monthly scores against the
+   certification rules in orbis_gha_perf_config. */
+
+/* up to the last 12 monthly records for a GHA, chronological order —
+   fewer than 12 is expected given the 6-month seed; callers must not
+   fabricate missing months to pad the window out */
+function ghoEvaluationWindow(ghaId) {
+  return getGhaPerfRecords().filter(r => r.ghaId === ghaId).sort((a, b) => a.period.localeCompare(b.period)).slice(-12);
+}
+
+function evaluateGhoEligibility(ghaId) {
+  const config = getActiveGhaPerfConfig();
+  const window = ghoEvaluationWindow(ghaId);
+  const zeroMetrics = { deployment: 0, serviceability: 0, suitability: 0, fuelEfficiency: 0 };
+  if (!window.length) {
+    return {
+      eligible: false, trailingAverageScore: 0, monthsBelow: 0, monthsAvailable: 0,
+      windowFrom: null, windowTo: null, basisMetrics: zeroMetrics,
+      reasonIneligible: 'No performance history available yet.'
+    };
+  }
+  const avg = key => Math.round(window.reduce((a, r) => a + r.metrics[key], 0) / window.length);
+  const trailingAverageScore = Math.round(window.reduce((a, r) => a + r.overallScore, 0) / window.length);
+  const monthsBelow = window.filter(r => r.overallScore < config.params.minimumThreshold).length;
+  const basisMetrics = { deployment: avg('deployment'), serviceability: avg('serviceability'), suitability: avg('suitability'), fuelEfficiency: avg('fuelEfficiency') };
+
+  const avgFail = trailingAverageScore < config.params.ghoAnnualThreshold;
+  const monthsFail = monthsBelow > config.params.ghoMaxMonthsBelow;
+  const eligible = !avgFail && !monthsFail;
+  let reasonIneligible = null;
+  if (avgFail && monthsFail) {
+    reasonIneligible = `Trailing average ${trailingAverageScore}% is below the ${config.params.ghoAnnualThreshold}% required, and ${monthsBelow} month(s) fell below minimum performance (max ${config.params.ghoMaxMonthsBelow} allowed).`;
+  } else if (avgFail) {
+    reasonIneligible = `Trailing average ${trailingAverageScore}% is below the ${config.params.ghoAnnualThreshold}% required.`;
+  } else if (monthsFail) {
+    reasonIneligible = `${monthsBelow} month(s) fell below minimum performance — only ${config.params.ghoMaxMonthsBelow} allowed within the window.`;
+  }
+
+  return {
+    eligible, trailingAverageScore, monthsBelow, monthsAvailable: window.length,
+    windowFrom: window[0].period, windowTo: window[window.length - 1].period,
+    basisMetrics, reasonIneligible
+  };
+}
+
+/* one evaluation pass across every active GHA. Issues, holds, downgrades to
+   AT_RISK, revokes (only on a SECOND consecutive failing pass — the current
+   status itself is the "was this already at risk?" flag, mirroring the
+   risk-engine's staged escalation instead of a full state machine), and
+   expires certificates whose validity window has passed. Returns a summary
+   for the "Re-evaluate now" toast. */
+function recomputeGhoStatuses() {
+  const certs = getGhoCertificates();
+  const config = getActiveGhaPerfConfig();
+  const evalNow = nowISO();
+  const summary = { issued: 0, atRisk: 0, revoked: 0, expired: 0, renewed: 0 };
+  const actor = 'System (GHO evaluation)';
+
+  getGhas().filter(g => g.status === 'ACTIVE').forEach(gha => {
+    const evalResult = evaluateGhoEligibility(gha.id);
+    let current = certs.filter(c => c.ghaId === gha.id && (c.status === 'ISSUED' || c.status === 'AT_RISK'))
+      .sort((a, b) => new Date(b.issuedAt) - new Date(a.issuedAt))[0] || null;
+
+    if (current && new Date(current.expiresAt) <= new Date(evalNow)) {
+      current.status = 'EXPIRED';
+      logActivity({ action: 'GHO certificate expired', target: gha.name, category: 'gho', severity: 'warn', actor });
+      summary.expired++;
+      current = null;   // immediately re-evaluate for a fresh one below
+    }
+
+    if (!current) {
+      if (evalResult.eligible && evalResult.monthsAvailable > 0) {
+        const issuedAt = evalNow;
+        const nc = {
+          id: uid('ghoc'), certificateNumber: nextGhoCertificateNumber(certs), ghaId: gha.id, periodType: 'ANNUAL',
+          evaluationWindow: { from: periodStartISO(evalResult.windowFrom), to: periodEndISO(evalResult.windowTo) },
+          trailingAverageScore: evalResult.trailingAverageScore, monthsBelow: evalResult.monthsBelow,
+          status: 'ISSUED', issuedAt, expiresAt: addMonthsISO(issuedAt, config.params.ghoValidityMonths),
+          revokedAt: null, revokedReason: null, basisMetrics: evalResult.basisMetrics
+        };
+        certs.push(nc);
+        logActivity({ action: 'GHO certificate issued', target: gha.name, category: 'gho', severity: 'success', actor });
+        summary.issued++;
+      }
+      return;
+    }
+
+    if (evalResult.eligible) {
+      if (current.status === 'AT_RISK') {
+        current.status = 'ISSUED';
+        logActivity({ action: 'GHO certificate renewed to good standing', target: gha.name, category: 'gho', severity: 'success', actor });
+        summary.renewed++;
+      }
+    } else if (current.status === 'ISSUED') {
+      current.status = 'AT_RISK';
+      logActivity({ action: `GHO certificate moved to at-risk — ${evalResult.reasonIneligible}`, target: gha.name, category: 'gho', severity: 'warn', actor });
+      summary.atRisk++;
+    } else if (current.status === 'AT_RISK') {
+      current.status = 'REVOKED';
+      current.revokedAt = evalNow;
+      current.revokedReason = evalResult.reasonIneligible;
+      logActivity({ action: `GHO certificate revoked — ${evalResult.reasonIneligible}`, target: gha.name, category: 'gho', severity: 'danger', actor });
+      summary.revoked++;
+    }
+  });
+
+  saveGhoCertificates(certs);
+  return summary;
+}
+
+/* ═══ GHO certificate document (Part C) ═════════════════════
+   A distinct, formal visual component — deliberately not styled like the
+   rest of the app's operational cards. Reused by the drawer's "View
+   Certificate" button, the registry's row click, and certificate history. */
+function ghoStatusInfo(status) {
+  return {
+    ISSUED: { label: 'Certified', cls: 'gho-issued' },
+    AT_RISK: { label: 'At Risk', cls: 'gho-atrisk' },
+    REVOKED: { label: 'Revoked', cls: 'gho-revoked' },
+    EXPIRED: { label: 'Expired', cls: 'gho-expired' },
+    NONE: { label: 'Not Certified', cls: 'gho-none' }
+  }[status || 'NONE'];
+}
+/* the status of the most recent certificate ever issued to this GHA,
+   regardless of whether it's still current — 'NONE' if it never held one */
+function ghaCertStatus(ghaId) {
+  const history = ghoCertificateHistory(ghaId);
+  return history.length ? history[0].status : 'NONE';
+}
+const GHO_BADGE_ICON = {
+  'gho-issued': '<path d="M12 2 L20 5 V11 C20 16 16.5 19.5 12 22 C7.5 19.5 4 16 4 11 V5 Z"/><path d="M9 12 L11 14 L16 9"/>',
+  'gho-atrisk': '<path d="M12 3 L21 19 H3 Z"/><path d="M12 9 v5"/><circle cx="12" cy="16.3" r="0.6" fill="currentColor"/>',
+  'gho-revoked': '<circle cx="12" cy="12" r="9"/><path d="M7 7 L17 17"/>',
+  'gho-expired': '<circle cx="12" cy="12" r="9"/><path d="M12 7 v5 l3.5 3"/>',
+  'gho-none': '<circle cx="12" cy="12" r="9" stroke-dasharray="2.5,3"/>'
+};
+/* small icon + label certificate-status indicator — reused on GHA cards,
+   the registry, and the drawer's Certification tab */
+function ghoBadgeHtml(ghaId) {
+  const info = ghoStatusInfo(ghaCertStatus(ghaId));
+  return `<span class="gho-badge ${info.cls}"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${GHO_BADGE_ICON[info.cls]}</svg>${info.label}</span>`;
+}
+/* hand-built circular seal/rosette — scalloped dot border, ring, and the
+   ORBIS brand star recentred at its core, all in the theme's blue palette */
+function ghoSealSVG(size) {
+  size = size || 90;
+  const cx = size / 2, cy = size / 2, rOuter = size / 2 - 3;
+  let dots = '';
+  const n = 20;
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * 2 * Math.PI;
+    dots += `<circle cx="${(cx + Math.cos(a) * rOuter).toFixed(1)}" cy="${(cy + Math.sin(a) * rOuter).toFixed(1)}" r="3" fill="var(--primary)"/>`;
+  }
+  const rMid = rOuter - 9, rCore = rMid - 7, starScale = (rCore * 1.5 / 24).toFixed(3);
+  return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" class="cert-seal-svg">
+    <g>${dots}</g>
+    <circle cx="${cx}" cy="${cy}" r="${rMid}" fill="none" stroke="var(--primary)" stroke-width="2"/>
+    <circle class="cert-seal-core" cx="${cx}" cy="${cy}" r="${rCore}" fill="var(--primary-light)" stroke="var(--primary-dark)" stroke-width="1.5"/>
+    <g transform="translate(${cx} ${cy}) scale(${starScale}) translate(-12 -12)">
+      <path d="M12 2 L14.5 9.5 L22 12 L14.5 14.5 L12 22 L9.5 14.5 L2 12 L9.5 9.5 Z" fill="var(--primary-dark)"/>
+    </g>
+  </svg>`;
+}
+/* deterministic, non-cryptographic 10-char verification code — printed on
+   the certificate so it reads like a real registry document; derived only
+   from the certificate's own id/number so it's stable across re-renders. */
+function certVerifyCode(cert) {
+  const src = (cert.id || '') + (cert.certificateNumber || '');
+  let h = 0;
+  for (let i = 0; i < src.length; i++) h = (h * 31 + src.charCodeAt(i)) >>> 0;
+  return h.toString(36).toUpperCase().padStart(10, '0').slice(-10);
+}
+function certificateDocumentHtml(cert) {
+  const gha = getGha(cert.ghaId);
+  const config = getActiveGhaPerfConfig();
+  const tier = ghaScoreTier(cert.trailingAverageScore, config.params.ghoAnnualThreshold);
+  const scoreColor = tier === 'green' ? 'var(--green)' : tier === 'amber' ? 'var(--amber)' : 'var(--red)';
+  const isDefaced = cert.status === 'REVOKED' || cert.status === 'EXPIRED';
+  const scope = gha && gha.airlinesServed && gha.airlinesServed.length
+    ? `ramp, baggage, and passenger handling services for ${gha.airlinesServed.join(', ')} operations`
+    : 'ramp, baggage, and passenger handling services for all scheduled carrier operations';
+  return `<div class="cert-doc cert-status-${cert.status.toLowerCase()}">
+    <div class="cert-border" id="cert-print-area">
+      <div class="cert-watermark">ORBIS</div>
+      ${cert.status === 'AT_RISK' ? '<div class="cert-ribbon">AT RISK</div>' : ''}
+      ${isDefaced ? `<div class="cert-stamp"><span>${escapeHtml(cert.status)}</span></div>` : ''}
+      <div class="cert-letterhead">Multan International Airport · MUX Ground Operations Authority</div>
+      <h1 class="cert-title">Ground Handling Operation Certificate</h1>
+      <div class="cert-meta-row">
+        <span class="cert-meta-chip">Station MUX</span>
+        <span class="cert-meta-chip">${escapeHtml(gha ? ghaOwnershipLabel(gha.ownership) : '—')}</span>
+        <span class="cert-meta-chip">Licence ${escapeHtml(gha ? gha.licenseNumber : '—')}</span>
+      </div>
+      <div class="cert-seal ${cert.status === 'ISSUED' ? 'cert-seal-flourish' : ''}">${ghoSealSVG(108)}</div>
+      <div class="cert-gha-name">${escapeHtml(gha ? gha.name : cert.ghaId)}</div>
+      <p class="cert-statement">has satisfied the ground handling operational performance standards of the ORBIS certification programme, evaluated against its trailing twelve-month operating record at MUX.</p>
+      <p class="cert-scope"><strong>Scope of certification:</strong> ${escapeHtml(scope)}.</p>
+      <div class="cert-figures">
+        <div class="cert-fig"><span class="cf-k">Certificate No.</span><span class="cf-v mono">${escapeHtml(cert.certificateNumber)}</span></div>
+        <div class="cert-fig"><span class="cf-k">Trailing Average Score</span><span class="cf-v mono" style="color:${scoreColor};font-size:20px">${cert.trailingAverageScore}%</span></div>
+        <div class="cert-fig"><span class="cf-k">Evaluation Window</span><span class="cf-v mono">${fmtDate(cert.evaluationWindow.from)} – ${fmtDate(cert.evaluationWindow.to)}</span></div>
+        <div class="cert-fig"><span class="cf-k">Months Below Minimum</span><span class="cf-v mono">${cert.monthsBelow}</span></div>
+        <div class="cert-fig"><span class="cf-k">Issued</span><span class="cf-v mono">${fmtDate(cert.issuedAt)}</span></div>
+        <div class="cert-fig"><span class="cf-k">Valid Until</span><span class="cf-v mono">${fmtDate(cert.expiresAt)}</span></div>
+      </div>
+      <div class="dw-perms" style="justify-content:center;display:flex;flex-wrap:wrap;gap:6px">
+        <span class="dw-perm">Deployment ${cert.basisMetrics.deployment}%</span>
+        <span class="dw-perm">Serviceability ${cert.basisMetrics.serviceability}%</span>
+        <span class="dw-perm">Suitability ${cert.basisMetrics.suitability}%</span>
+        <span class="dw-perm">Fuel Eff. ${cert.basisMetrics.fuelEfficiency}%</span>
+      </div>
+      ${cert.status === 'REVOKED' ? `<p class="cert-revoke-note">Revoked ${fmtDate(cert.revokedAt)} — ${escapeHtml(cert.revokedReason || '')}</p>` : ''}
+      <div class="cert-foot">
+        <div class="cert-sig-row">
+          <div class="cert-sig">
+            <div class="cert-sig-script">${escapeHtml(gha && gha.contactName ? gha.contactName : 'Authorized Signatory')}</div>
+            <div class="cert-sig-line"></div>
+            <div class="cert-sig-name">${escapeHtml(gha && gha.contactName ? gha.contactName : 'Authorized Signatory')}</div>
+            <div class="cert-sig-role">GHA Authorized Representative</div>
+          </div>
+          <div class="cert-sig">
+            <div class="cert-sig-script">Capt. Salman Raza</div>
+            <div class="cert-sig-line"></div>
+            <div class="cert-sig-name">Capt. Salman Raza</div>
+            <div class="cert-sig-role">Station Duty Manager · MUX</div>
+          </div>
+        </div>
+        <p class="cert-idline mono">${escapeHtml(cert.periodType)} certification · issued under active scoring configuration</p>
+        <p class="cert-verify mono">Verification code ${certVerifyCode(cert)} · this document is invalid without the official seal and both authorized signatures</p>
+      </div>
+    </div>
+  </div>`;
+}
+/* returnToGhaId: when the certificate is opened from inside a GHA's detail
+   modal, closing this view must reopen that modal (a "back" step), not just
+   blank the shared #modal-host — otherwise the GHA detail is lost entirely. */
+function openCertificateView(certId, returnToGhaId) {
+  const cert = getGhoCertificate(certId); if (!cert) return;
+  const back = returnToGhaId ? () => openGhaDetail(returnToGhaId) : closeModal;
+  const modal = openModal(`
+    <div class="modal-head"><div><h3>Certificate</h3><p class="mono">${escapeHtml(cert.certificateNumber)}</p></div>
+      <button class="modal-x" data-x aria-label="${returnToGhaId ? 'Back' : 'Close'}"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6 L18 18 M18 6 L6 18"/></svg></button></div>
+    <div class="cert-doc-actions">
+      <button class="btn btn-ghost btn-sm" id="cert-tab-btn" type="button">Open in New Tab</button>
+      <button class="btn btn-primary btn-sm" id="cert-print-btn" type="button">Print / Save as PDF</button>
+    </div>
+    ${certificateDocumentHtml(cert)}`, true);
+  modal.classList.add('cert-view-modal');
+  const host = document.getElementById('modal-host');
+  host.onclick = e => { if (e.target === host) back(); };
+  modal.querySelectorAll('[data-x]').forEach(b => b.onclick = back);
+  modal.querySelector('#cert-print-btn').onclick = () => printCertificate(cert);
+  modal.querySelector('#cert-tab-btn').onclick = () => openCertificateInNewTab(cert);
+}
+
+/* Shared by the print flow and the plain "Open in New Tab" preview — a
+   standalone document with NOTHING in it but the certificate (same
+   stylesheet + fonts as the app, so it looks identical). Printing straight
+   out of the in-app modal relies on hiding the rest of the SPA
+   (visibility:hidden on everything but #cert-print-area), and that trick is
+   fragile in Chrome's print/PDF pagination — the modal's own scroll
+   clipping, the app shell's fixed-height ancestor, and the hidden-but-
+   still-in-flow siblings around it can all still influence page breaks,
+   which is what caused the certificate to print as a mostly-blank first
+   page with the rest spilling onto a second sheet. With no app chrome to
+   hide, no scroll container to clip it, and no sibling content to push it
+   around, it always starts at the top of page one and fits the A4 page. */
+function certStandaloneDocHtml(cert) {
+  const styleHref = new URL('style.css', location.href).href;
+  const fontsHref = 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700;800&family=Caveat:wght@600;700&display=swap';
+  return `<!doctype html><html><head><meta charset="UTF-8"/>
+<title>${escapeHtml(cert.certificateNumber)}</title>
+<link rel="stylesheet" href="${fontsHref}"/>
+<link rel="stylesheet" href="${styleHref}"/>
+<style>
+  @page{ size:A4; margin:14mm; }
+  html,body{ margin:0; background:#EEF2F7; display:flex; flex-direction:column; align-items:center; }
+  body{ padding:28px 16px 60px; width:100%; }
+  /* .cert-doc/.cert-border are normally block children that just fill
+     whatever container sizes them (the in-app modal, previously); as a
+     flex item under align-items:center they have nothing to size against
+     and shrink to their own content's fit-content width instead — this is
+     what printed/previewed as a narrow sliver in the corner of the page.
+     An explicit width fixes both the on-screen preview and the printed A4
+     page (182mm = A4 minus the 14mm @page margins on each side). */
+  .cert-doc{ width:800px; max-width:100%; }
+  .cert-tab-bar{ width:800px; max-width:100%; margin-bottom:16px; display:flex; justify-content:flex-end; }
+  @media print{
+    html,body{ background:#fff; }
+    body{ padding:0; }
+    .cert-doc{ width:182mm; max-width:182mm; }
+    .cert-tab-bar{ display:none; }
+  }
+</style>
+</head><body>
+<div class="cert-tab-bar"><button class="btn btn-primary btn-sm" id="cert-tab-print" onclick="window.print()" type="button">Print / Save as PDF</button></div>
+${certificateDocumentHtml(cert)}
+</body></html>`;
+}
+/* Save as PDF from the in-modal button used to open its own popup and call
+   w.print() from the OPENER's 'load' listener — that sometimes fired print()
+   before the popup had actually painted anything, so the print preview (and
+   the tab underneath it) came up blank. "Open in New Tab" never had that
+   problem because print only ever runs from a real click the user makes
+   after the tab is visibly rendered. So this now opens the exact same tab
+   (identical markup to openCertificateInNewTab, print button included) and
+   simulates that same click once the tab reports itself loaded — same
+   proven path, just one click instead of two. If anything still goes
+   sideways the tab is left open with its own working print button as a
+   fallback, instead of silently failing. */
+function printCertificate(cert) {
+  const w = window.open('', '_blank');
+  if (!w) { showToast('Pop-up blocked — allow pop-ups for this site to save the certificate as PDF', 'error'); return; }
+  w.document.write(certStandaloneDocHtml(cert));
+  w.document.close();
+  w.addEventListener('load', () => {
+    w.focus();
+    w.requestAnimationFrame(() => w.requestAnimationFrame(() => {
+      const btn = w.document.getElementById('cert-tab-print');
+      if (btn) btn.click(); else w.print();
+    }));
+  });
+}
+function openCertificateInNewTab(cert) {
+  const w = window.open('', '_blank');
+  if (!w) { showToast('Pop-up blocked — allow pop-ups for this site to open the certificate', 'error'); return; }
+  w.document.write(certStandaloneDocHtml(cert));
+  w.document.close();
+}
+
+/* ═══ GHA performance — shared UI pieces (ring, warning banner) ═════
+   Reused by the GHA card badge, the drawer's Performance tab, and the
+   leaderboard so the same score always looks the same everywhere. */
+function perfRingHtml(score, threshold, size, fontSize) {
+  size = size || 48; fontSize = fontSize || Math.round(size * 0.26);
+  const stroke = Math.max(4, Math.round(size * 0.11));
+  const R = size / 2 - stroke, CIRC = 2 * Math.PI * R;
+  const tier = ghaScoreTier(score, threshold);
+  const color = tier === 'green' ? 'var(--green)' : tier === 'amber' ? 'var(--amber)' : 'var(--red)';
+  const frac = ENGINE.clamp(score, 0, 100) / 100;
+  return `<div class="perf-ring-wrap" style="width:${size}px;height:${size}px">
+    <svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
+      <circle cx="${size / 2}" cy="${size / 2}" r="${R}" fill="none" stroke="var(--surface-alt)" stroke-width="${stroke}"/>
+      <circle class="perf-ring-fill" cx="${size / 2}" cy="${size / 2}" r="${R}" fill="none" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"
+        transform="rotate(-90 ${size / 2} ${size / 2})" stroke-dasharray="${CIRC.toFixed(1)}" stroke-dashoffset="${CIRC.toFixed(1)}"
+        data-target="${(CIRC * (1 - frac)).toFixed(1)}"/>
+    </svg>
+    <div class="perf-ring-num mono" style="font-size:${fontSize}px;color:${color}">${score}</div>
+  </div>`;
+}
+function animatePerfRings(root) {
+  const els = (root || document).querySelectorAll('.perf-ring-fill');
+  requestAnimationFrame(() => { els.forEach(gf => { gf.style.transition = 'stroke-dashoffset .8s var(--ease)'; gf.style.strokeDashoffset = gf.dataset.target; }); });
+}
+/* GHAs whose CURRENT month is below minimum — the single source both the
+   GHA Management banner and the Manager Dashboard panel read from */
+function ghasBelowMinimum() {
+  const config = getActiveGhaPerfConfig();
+  const period = currentPeriod();
+  return getGhas().filter(g => g.status === 'ACTIVE').map(g => ({ gha: g, rec: getGhaPerfRecord(g.id, period) }))
+    .filter(x => x.rec && x.rec.belowMinimum)
+    .map(x => Object.assign({ threshold: config.params.minimumThreshold }, x));
+}
+function ghaWarningLineHtml(x) {
+  const weak = ghaWeakestMetric(x.rec.metrics);
+  return `<div class="esc-row r-AMBER" data-gha-id="${x.gha.id}" style="cursor:pointer">
+    <span class="esc-fl mono">${escapeHtml(x.gha.code)}</span>
+    <span class="esc-stage stage-SMS_SENT">${x.rec.overallScore}/100</span>
+    <span class="esc-lbl">Below minimum (${x.threshold}) — driven by low ${escapeHtml(weak.label.toLowerCase())} (${weak.score}%)</span>
+  </div>`;
+}
+
+/* ═══ financial & suitability helpers ══════════════════════
+   currentBookValue is a LIVE straight-line depreciation read — never stored,
+   always derived from financial.acquisitionCost/acquisitionDate/usefulLifeYears
+   so it stays correct as time passes. Floors at a 10% residual value. */
+function fmtMoney(n) { return '$' + Math.round(n).toLocaleString('en-US'); }
+function fmtMoneyCompact(n) {
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return '$' + (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+  if (abs >= 1e3) return '$' + (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+  return '$' + Math.round(n);
+}
+function currentBookValue(unit) {
+  const f = unit.financial; if (!f) return 0;
+  const residual = f.acquisitionCost * 0.10;
+  const ageYears = (Date.now() - new Date(f.acquisitionDate).getTime()) / (365.25 * 864e5);
+  if (ageYears <= 0) return f.acquisitionCost;
+  if (ageYears >= f.usefulLifeYears) return residual;
+  return Math.max(residual, f.acquisitionCost - (f.acquisitionCost - residual) * (ageYears / f.usefulLifeYears));
+}
+const AIRCRAFT_TYPE_LIST = Object.keys(AIRCRAFT_SPECS);
+function ownBadge(ownership) {
+  return `<span class="own-badge ${ownership === 'AIRPORT' ? 'own-airport' : 'own-gha'} mono">${ownership === 'AIRPORT' ? 'AIRPORT' : 'GHA'}</span>`;
+}
+function suitabilityTagsHtml(unit) {
+  const list = (unit.suitableFor && unit.suitableFor.length) ? unit.suitableFor : ['ALL'];
+  if (list.length === 1 && list[0] === 'ALL') return `<span class="dw-perm">Universal</span>`;
+  return list.map(a => `<span class="dw-perm">${escapeHtml(a)}</span>`).join('');
+}
+/* straight-line book-value chart: acquisition cost declining to the 10%
+   residual floor across the useful-life horizon, with a "today" marker */
+function bookValueChartSVG(unit) {
+  const f = unit.financial;
+  const W = 300, H = 150, padL = 46, padB = 20, padT = 10, padR = 8;
+  const residual = f.acquisitionCost * 0.10;
+  const ageYears = ENGINE.clamp((Date.now() - new Date(f.acquisitionDate).getTime()) / (365.25 * 864e5), 0, f.usefulLifeYears);
+  const x = yrs => padL + (yrs / f.usefulLifeYears) * (W - padL - padR);
+  const y = val => padT + (1 - (val - residual) / (f.acquisitionCost - residual || 1)) * (H - padT - padB);
+  const pts = [[x(0), y(f.acquisitionCost)], [x(f.usefulLifeYears), y(residual)]];
+  const areaPts = [[x(0), y(residual)], ...pts, [x(f.usefulLifeYears), y(residual)]];
+  const nowVal = currentBookValue(unit);
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%">
+    ${[f.acquisitionCost, (f.acquisitionCost + residual) / 2, residual].map(v => `<line x1="${padL}" y1="${y(v).toFixed(1)}" x2="${W - padR}" y2="${y(v).toFixed(1)}" class="tl-grid"/><text x="2" y="${(y(v) + 3).toFixed(1)}" class="an-axis mono">${fmtMoneyCompact(v)}</text>`).join('')}
+    <path d="${polyPath(areaPts)} Z" class="tl-area"/>
+    <path d="${polyPath(pts)}" class="tl-line"/>
+    <circle cx="${x(ageYears).toFixed(1)}" cy="${y(nowVal).toFixed(1)}" r="4" fill="var(--primary)" class="tl-pt"/>
+    <text x="${x(ageYears).toFixed(1)}" y="${H - 4}" text-anchor="middle" class="an-axis mono">today</text>
+    <text x="${W - padR}" y="${H - 4}" text-anchor="end" class="an-axis mono">${f.usefulLifeYears}y</text></svg>`;
+}
+/* utilisation bar: this month's deployment hours against an 8hr/day × days-elapsed reference */
+function utilisationBarHtml(hours) {
+  const daysElapsed = new Date().getDate();
+  const capacity = Math.max(1, daysElapsed * 8);
+  const pct = Math.min(100, Math.round(hours / capacity * 100));
+  const color = pct >= 70 ? 'var(--green)' : pct >= 40 ? 'var(--amber)' : 'var(--red)';
+  return `<div class="gt-bar" style="margin-top:8px"><span class="gt-fill" style="width:${pct}%;background:${color};animation:barSlide .5s var(--ease) both;transform-origin:left"></span></div>
+    <p class="mono" style="font-size:11.5px;color:var(--text-mute);margin-top:5px">${hours}h of ${capacity}h reference capacity this month (${pct}%)</p>`;
+}
+/* GSE Entry info affordance: universal vs aircraft-restricted split among a type's serviceable units */
+function suitabilityInfoTitle(typeCode) {
+  const units = getGse().filter(u => u.typeCode === typeCode && u.status === 'SERVICEABLE');
+  if (!units.length) return '';
+  const universal = units.filter(u => { const s = u.suitableFor || ['ALL']; return s.length === 1 && s[0] === 'ALL'; }).length;
+  const restricted = units.length - universal;
+  if (!restricted) return '';
+  return `${universal} universal · ${restricted} aircraft-type restricted (of ${units.length} serviceable)`;
+}
+
+function equipGrade(score) {
+  if (score >= 80) return { grade: 'A', label: 'Grade A', class: 'grade-a', meaning: 'Fit for peak operations', tier: 'Tier 1 · Prime' };
+  if (score >= 60) return { grade: 'B', label: 'Grade B', class: 'grade-b', meaning: 'Usable, monitor closely', tier: 'Tier 2 · Nominal' };
+  if (score >= 40) return { grade: 'C', label: 'Grade C', class: 'grade-c', meaning: 'High risk, backup ready', tier: 'Tier 3 · High Risk' };
+  return { grade: 'D', label: 'Grade D', class: 'grade-d', meaning: 'Grounded / replacement required', tier: 'Tier 4 · Critical' };
+}
+
+let equipFilter = { q: '', type: 'ALL', status: 'ALL', gha: 'ALL', ownership: 'ALL', grade: 'ALL', sortBy: 'PERF_DESC' };
+
+function filterAndSortEquipRows(fleet) {
   const q = equipFilter.q.toLowerCase();
   let rows = fleet.filter(u => {
     if (equipFilter.type !== 'ALL' && u.type !== equipFilter.type) return false;
     if (equipFilter.status !== 'ALL' && u.status !== equipFilter.status) return false;
     if (equipFilter.gha !== 'ALL' && ghaOf(u) !== equipFilter.gha) return false;
+    if (equipFilter.ownership !== 'ALL' && u.ownership !== equipFilter.ownership) return false;
+    if (equipFilter.grade !== 'ALL') {
+      const ps = u.nonFinancial && u.nonFinancial.performanceScore;
+      const s = ps ? ps.finalScore : 0;
+      if (equipGrade(s).grade !== equipFilter.grade) return false;
+    }
     if (q && !(`${u.serial} ${u.type}`.toLowerCase().includes(q))) return false;
     return true;
   });
+
+  rows.sort((a, b) => {
+    const scoreA = (a.nonFinancial && a.nonFinancial.performanceScore) ? a.nonFinancial.performanceScore.finalScore : 0;
+    const scoreB = (b.nonFinancial && b.nonFinancial.performanceScore) ? b.nonFinancial.performanceScore.finalScore : 0;
+    
+    if (equipFilter.sortBy === 'PERF_DESC') {
+      if (scoreB !== scoreA) return scoreB - scoreA;
+      return (b.mtbfHours || 0) - (a.mtbfHours || 0); // Tie-breaker: higher reliability MTBF first
+    }
+    if (equipFilter.sortBy === 'PERF_ASC') {
+      if (scoreA !== scoreB) return scoreA - scoreB;
+      return (a.mtbfHours || 0) - (b.mtbfHours || 0);
+    }
+    if (equipFilter.sortBy === 'SERIAL') {
+      return a.serial.localeCompare(b.serial);
+    }
+    if (equipFilter.sortBy === 'NEXT_DUE') {
+      return new Date(a.nextServiceDue) - new Date(b.nextServiceDue);
+    }
+    if (equipFilter.sortBy === 'FAIL_PROB') {
+      return unitFailureProb(b) - unitFailureProb(a);
+    }
+    return 0;
+  });
+  return rows;
+}
+
+function renderEquipment(el) {
+  const fleet = getGse();
+  const active = fleet.filter(u => u.status !== 'RETIRED');
+  const types = [...new Set(fleet.map(u => u.type))];
+
+  /* the fleet-strip tiles read the selected GHA card (equipFilter.gha) so
+     the summary numbers actually reflect the operator you clicked, instead
+     of always showing whole-fleet totals no matter what's selected. */
+  const scopeId = equipFilter.gha !== 'ALL' ? equipFilter.gha : null;
+  const scopeGha = scopeId ? getGha(scopeId) : null;
+  const scoped = scopeId ? active.filter(u => ghaOf(u) === scopeId) : active;
+
+  const svcPct = scoped.length ? Math.round(scoped.filter(u => u.status === 'SERVICEABLE').length / scoped.length * 100) : 0;
+  const inMaint = scoped.filter(u => u.status === 'MAINTENANCE').length;
+  const overdue = scoped.filter(u => new Date(u.nextServiceDue) < new Date()).length;
+
+  const totalBookValue = scoped.reduce((sum, u) => sum + currentBookValue(u), 0);
+  const ghaOwnedCount = scoped.filter(u => u.ownership === 'GHA').length;
+  const airportOwnedCount = scoped.filter(u => u.ownership === 'AIRPORT').length;
+  const ownSplitTotal = Math.max(1, ghaOwnedCount + airportOwnedCount);
+  const ghaOwnedPct = Math.round(ghaOwnedCount / ownSplitTotal * 100);
+
+  const fleetPerfAvg = avgFleetPerfScore(scopeId);
+  const reviewCount = unitsNearFloor(scopeId).length;
+
+  // Grade distributions count
+  const gradeCounts = { A: 0, B: 0, C: 0, D: 0 };
+  scoped.forEach(u => {
+    const s = (u.nonFinancial && u.nonFinancial.performanceScore) ? u.nonFinancial.performanceScore.finalScore : 0;
+    gradeCounts[equipGrade(s).grade]++;
+  });
+
+  /* group active fleet by operating GHA */
+  const ghas = getGhas();
+  const ghaGroups = {};
+  ghas.forEach(g => ghaGroups[g.id] = { total: 0, svc: 0 });
+  active.forEach(u => { const id = ghaOf(u); if (!id) return; (ghaGroups[id] = ghaGroups[id] || { total: 0, svc: 0 }); ghaGroups[id].total++; if (u.status === 'SERVICEABLE') ghaGroups[id].svc++; });
+  const unassignedCount = active.filter(u => !ghaOf(u)).length;
+
+  const rows = filterAndSortEquipRows(fleet);
 
   el.innerHTML = `
     <div class="mod-wide">
@@ -3307,24 +5471,48 @@ function renderEquipment(el) {
         <p class="mod-sub">${active.length} active units · fleet management</p></div>
         <button class="btn btn-primary btn-sm" id="eq-add" type="button">+ Add unit</button></div>
 
+      <div class="fs-scope-row">
+        <span class="fs-scope-note mono">${scopeGha ? `Fleet snapshot — ${escapeHtml(scopeGha.name)}` : 'Fleet snapshot — all operators'}</span>
+        ${scopeGha ? `<button class="fs-scope-clear" id="eq-scope-clear" type="button">Clear ×</button>` : ''}
+      </div>
       <div class="fleet-strip">
-        <div class="fs-tile"><span class="fs-num mono">${active.length}</span><span class="fs-lbl">Active units</span></div>
+        <div class="fs-tile"><span class="fs-num mono">${scoped.length}</span><span class="fs-lbl">Active units</span></div>
         <div class="fs-tile"><span class="fs-num mono">${svcPct}%</span><span class="fs-lbl">Serviceable</span></div>
         <div class="fs-tile"><span class="fs-num mono">${inMaint}</span><span class="fs-lbl">In maintenance</span></div>
         <div class="fs-tile ${overdue ? 'warn' : ''}"><span class="fs-num mono">${overdue}</span><span class="fs-lbl">Overdue service</span></div>
+        <div class="fs-tile"><span class="fs-num mono" id="eq-num-bookval">$0</span><span class="fs-lbl">Total fleet book value</span></div>
+        <div class="fs-tile">
+          <span class="fs-num mono" style="font-size:16px">${ghaOwnedCount} GHA · ${airportOwnedCount} Airport</span>
+          <span class="fs-lbl">Ownership split</span>
+          <div class="gt-bar" style="height:6px;display:flex;overflow:hidden;margin-top:6px">
+            <span style="display:block;height:100%;width:${ghaOwnedPct}%;background:#7C3AED"></span>
+            <span style="display:block;height:100%;width:${100 - ghaOwnedPct}%;background:#0F766E"></span>
+          </div>
+        </div>
+        <div class="fs-tile">
+          <span class="fs-num mono" id="eq-num-perf">0%</span>
+          <span class="fs-lbl">Avg perf score</span>
+          <div class="eq-grade-pills">
+            <span class="grade-badge grade-a" title="Grade A: ${gradeCounts.A} units">A: ${gradeCounts.A}</span>
+            <span class="grade-badge grade-b" title="Grade B: ${gradeCounts.B} units">B: ${gradeCounts.B}</span>
+            <span class="grade-badge grade-c" title="Grade C: ${gradeCounts.C} units">C: ${gradeCounts.C}</span>
+            <span class="grade-badge grade-d" title="Grade D: ${gradeCounts.D} units">D: ${gradeCounts.D}</span>
+          </div>
+          ${reviewCount > 0 ? `<span class="eq-review-badge" style="margin-top:4px">${reviewCount} units due for review</span>` : ''}
+        </div>
       </div>
 
       <!-- GROUND HANDLING AGENTS (MUX) -->
       <div class="gha-section">
         <div class="gha-head"><h3 class="card-h" style="margin:0">Ground Handling Agents · Multan (MUX)</h3>
-          <span class="gha-sub mono">${GHA_ORDER.filter(id => ghaGroups[id] && ghaGroups[id].total).length} agents operating this fleet</span></div>
+          <span class="gha-sub mono">${ghas.filter(g => ghaGroups[g.id] && ghaGroups[g.id].total).length} agents operating this fleet${unassignedCount ? ` · ${unassignedCount} unassigned` : ''}</span></div>
         <div class="gha-grid">
-          ${GHA_ORDER.filter(id => ghaGroups[id] && ghaGroups[id].total).map(id => { const g = GHAS[id]; const grp = ghaGroups[id];
+          ${ghas.filter(g => ghaGroups[g.id] && ghaGroups[g.id].total).map((g, i) => { const grp = ghaGroups[g.id]; const color = ghaColorFor(g.id);
             const pct = grp.total ? Math.round(grp.svc / grp.total * 100) : 0;
-            return `<button class="gha-card ${equipFilter.gha === id ? 'active' : ''}" data-gha="${id}" type="button" style="--gha:${g.color}">
-              <div class="ghc-top"><span class="ghc-name">${escapeHtml(g.name)}</span><span class="gha-badge" style="--gha:${g.color}">${escapeHtml(g.short)}</span></div>
-              <div class="ghc-role">${escapeHtml(g.role)}</div>
-              <div class="ghc-carriers">${escapeHtml(g.carriers)}</div>
+            return `<button class="gha-card card-stagger ${equipFilter.gha === g.id ? 'active' : ''}" data-gha="${g.id}" type="button" style="--gha:${color};animation-delay:${i * 40}ms">
+              <div class="ghc-top"><span class="ghc-name">${escapeHtml(g.name)}</span><span class="gha-badge" style="--gha:${color}">${escapeHtml(g.code)}</span></div>
+              <div class="ghc-role">${escapeHtml(ghaOwnershipLabel(g.ownership))}</div>
+              <div class="ghc-carriers">${escapeHtml(ghaAirlinesLabel(g))}</div>
               <div class="ghc-foot"><span class="mono ghc-units">${grp.total} units</span><span class="ghc-bar"><span style="width:${pct}%"></span></span><span class="mono ghc-pct">${pct}% svc</span></div>
             </button>`; }).join('')}
         </div>
@@ -3333,23 +5521,58 @@ function renderEquipment(el) {
       <div class="filters" style="border:1px solid var(--border);border-radius:var(--r);margin-bottom:16px">
         <div class="search"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20 L16.5 16.5"/></svg>
           <input type="text" id="eq-search" placeholder="Search serial or type…" value="${escapeHtml(equipFilter.q)}"/></div>
-        <select id="eq-gha" class="filter-select"><option value="ALL">All operators (GHA)</option>${GHA_ORDER.map(id => `<option value="${id}" ${equipFilter.gha === id ? 'selected' : ''}>${escapeHtml(GHAS[id].name)}</option>`).join('')}</select>
+        <select id="eq-sort" class="filter-select" title="Sort and Rank by">
+          <option value="PERF_DESC" ${equipFilter.sortBy === 'PERF_DESC' ? 'selected' : ''}>🏆 Rank: High → Low</option>
+          <option value="PERF_ASC" ${equipFilter.sortBy === 'PERF_ASC' ? 'selected' : ''}>🔻 Score: Low → High</option>
+          <option value="SERIAL" ${equipFilter.sortBy === 'SERIAL' ? 'selected' : ''}>Serial Number</option>
+          <option value="NEXT_DUE" ${equipFilter.sortBy === 'NEXT_DUE' ? 'selected' : ''}>Next Service Due</option>
+          <option value="FAIL_PROB" ${equipFilter.sortBy === 'FAIL_PROB' ? 'selected' : ''}>Failure Probability</option>
+        </select>
+        <select id="eq-grade" class="filter-select">
+          <option value="ALL" ${equipFilter.grade === 'ALL' ? 'selected' : ''}>All Grades (A-D)</option>
+          <option value="A" ${equipFilter.grade === 'A' ? 'selected' : ''}>Grade A (80-100 · Peak)</option>
+          <option value="B" ${equipFilter.grade === 'B' ? 'selected' : ''}>Grade B (60-79 · Usable)</option>
+          <option value="C" ${equipFilter.grade === 'C' ? 'selected' : ''}>Grade C (40-59 · High Risk)</option>
+          <option value="D" ${equipFilter.grade === 'D' ? 'selected' : ''}>Grade D (0-39 · Grounded)</option>
+        </select>
+        <select id="eq-gha" class="filter-select"><option value="ALL">All operators (GHA)</option>${ghas.map(g => `<option value="${g.id}" ${equipFilter.gha === g.id ? 'selected' : ''}>${escapeHtml(g.name)}</option>`).join('')}</select>
         <select id="eq-type" class="filter-select"><option value="ALL">All types</option>${types.map(t => `<option value="${escapeHtml(t)}" ${equipFilter.type === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
         <select id="eq-status" class="filter-select"><option value="ALL">All statuses</option>${['SERVICEABLE', 'UNSERVICEABLE', 'MAINTENANCE', 'RETIRED'].map(s => `<option value="${s}" ${equipFilter.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+        <select id="eq-ownership" class="filter-select"><option value="ALL" ${equipFilter.ownership === 'ALL' ? 'selected' : ''}>All ownership</option><option value="GHA" ${equipFilter.ownership === 'GHA' ? 'selected' : ''}>GHA-owned</option><option value="AIRPORT" ${equipFilter.ownership === 'AIRPORT' ? 'selected' : ''}>Airport-owned</option></select>
       </div>
 
       <div class="card" style="padding:0"><div class="table-scroll"><table class="eq-tbl">
-        <thead><tr><th>Unit</th><th>Type</th><th>Operator (GHA)</th><th>Serial</th><th>Status</th><th>MTBF</th><th>Last service</th><th>Next due</th><th>Fail prob</th><th></th></tr></thead>
-        <tbody>${rows.length ? rows.map(u => equipRowHtml(u)).join('') : `<tr><td colspan="10">${emptyState('No units match', 'Adjust the search or filters.')}</td></tr>`}</tbody>
+        <thead><tr><th>Unit</th><th>Type</th><th>Operator (GHA)</th><th>Ownership</th><th>Serial</th><th>Status</th><th>MTBF</th><th>Last service</th><th>Next due</th><th>Perf & Grade</th><th>Fail prob</th><th></th></tr></thead>
+        <tbody>${rows.length ? rows.map((u, i) => equipRowHtml(u, i)).join('') : `<tr><td colspan="12">${emptyState('No units match', 'Adjust the search or filters.')}</td></tr>`}</tbody>
       </table></div></div>
     </div>`;
 
+  countUpMoney(document.getElementById('eq-num-bookval'), totalBookValue);
+  const perfEl = document.getElementById('eq-num-perf');
+  if (perfEl) {
+    const target = fleetPerfAvg;
+    const dur = 600;
+    const start = performance.now();
+    (function tick(now) {
+      const p = Math.min(1, (now - start) / dur);
+      const ease = 1 - Math.pow(1 - p, 3);
+      perfEl.textContent = Math.round(ease * target) + '%';
+      if (p < 1) requestAnimationFrame(tick);
+    })(start);
+  }
+  animatePerfRings(el);
+
   el.querySelector('#eq-add').onclick = () => openEquipModal(null);
   el.querySelector('#eq-search').oninput = e => { equipFilter.q = e.target.value; renderEquipmentTableOnly(); };
+  el.querySelector('#eq-sort').onchange = e => { equipFilter.sortBy = e.target.value; renderEquipmentTableOnly(); };
+  el.querySelector('#eq-grade').onchange = e => { equipFilter.grade = e.target.value; renderEquipmentTableOnly(); };
   el.querySelector('#eq-type').onchange = e => { equipFilter.type = e.target.value; renderEquipmentTableOnly(); };
   el.querySelector('#eq-status').onchange = e => { equipFilter.status = e.target.value; renderEquipmentTableOnly(); };
+  el.querySelector('#eq-ownership').onchange = e => { equipFilter.ownership = e.target.value; renderEquipmentTableOnly(); };
   el.querySelector('#eq-gha').onchange = e => { equipFilter.gha = e.target.value; renderEquipmentBody(); };
   el.querySelectorAll('.gha-card').forEach(c => c.onclick = () => { equipFilter.gha = equipFilter.gha === c.dataset.gha ? 'ALL' : c.dataset.gha; renderEquipmentBody(); });
+  const scopeClearBtn = el.querySelector('#eq-scope-clear');
+  if (scopeClearBtn) scopeClearBtn.onclick = () => { equipFilter.gha = 'ALL'; renderEquipmentBody(); };
   el.querySelector('.eq-tbl tbody').onclick = handleEquipRowClick;
 }
 
@@ -3357,15 +5580,9 @@ function renderEquipmentTableOnly() {
   const tbody = document.querySelector('.eq-tbl tbody');
   if (!tbody) return;
   const fleet = getGse();
-  const q = equipFilter.q.toLowerCase();
-  let rows = fleet.filter(u => {
-    if (equipFilter.type !== 'ALL' && u.type !== equipFilter.type) return false;
-    if (equipFilter.status !== 'ALL' && u.status !== equipFilter.status) return false;
-    if (equipFilter.gha !== 'ALL' && ghaOf(u) !== equipFilter.gha) return false;
-    if (q && !(`${u.serial} ${u.type}`.toLowerCase().includes(q))) return false;
-    return true;
-  });
-  tbody.innerHTML = rows.length ? rows.map(u => equipRowHtml(u)).join('') : `<tr><td colspan="10">${emptyState('No units match', 'Adjust the search or filters.')}</td></tr>`;
+  const rows = filterAndSortEquipRows(fleet);
+  tbody.innerHTML = rows.length ? rows.map((u, i) => equipRowHtml(u, i)).join('') : `<tr><td colspan="12">${emptyState('No units match', 'Adjust the search or filters.')}</td></tr>`;
+  animatePerfRings(document.querySelector('.eq-tbl'));
 }
 
 function renderEquipmentBody() {
@@ -3386,16 +5603,43 @@ function renderEquipmentBody() {
   }
 }
 
-function equipRowHtml(u) {
+function equipPerfMiniRing(u, rankIndex) {
+  const ps = u.nonFinancial && u.nonFinancial.performanceScore;
+  const score = ps ? ps.finalScore : 0;
+  const gr = equipGrade(score);
+  const color = score >= 80 ? 'var(--green)' : score >= 60 ? '#0D9488' : score >= 40 ? 'var(--amber)' : 'var(--red)';
+  const size = 28, stroke = 3, R = size / 2 - stroke, CIRC = 2 * Math.PI * R;
+  const frac = ENGINE.clamp(score, 0, 100) / 100;
+  const rankTag = (rankIndex !== undefined && equipFilter.sortBy === 'PERF_DESC') 
+    ? `<span class="eq-rank-num ${rankIndex < 3 ? 'eq-rank-top' : ''}">#${rankIndex + 1}</span>` 
+    : '';
+
+  return `<td><div class="eq-cell-perf" title="${escapeHtml(gr.label)} (${score}%) · ${escapeHtml(gr.meaning)}">
+    ${rankTag}
+    <div class="eq-perf-mini">
+      <svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
+        <circle cx="${size/2}" cy="${size/2}" r="${R}" fill="none" stroke="var(--surface-alt)" stroke-width="${stroke}"/>
+        <circle class="perf-ring-fill" cx="${size/2}" cy="${size/2}" r="${R}" fill="none" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"
+          transform="rotate(-90 ${size/2} ${size/2})" stroke-dasharray="${CIRC.toFixed(1)}" stroke-dashoffset="${CIRC.toFixed(1)}"
+          data-target="${(CIRC * (1 - frac)).toFixed(1)}"/>
+      </svg>
+      <div class="perf-ring-num mono" style="font-size:9px;color:${color}">${score}</div>
+    </div>
+    <span class="grade-badge ${gr.class}">${gr.grade}</span>
+  </div></td>`;
+}
+
+function equipRowHtml(u, index) {
   const overdue = new Date(u.nextServiceDue) < new Date() && u.status !== 'RETIRED';
   const fp = unitFailureProb(u);
   const stCls = { SERVICEABLE: 'ok', UNSERVICEABLE: 'bad', MAINTENANCE: 'maint', RETIRED: 'ret' }[u.status];
   return `<tr data-unit="${u.id}" class="${u.status === 'UNSERVICEABLE' ? 'row-uns' : ''} ${overdue ? 'row-overdue' : ''}">
-    <td class="mono">${escapeHtml(u.id.replace('gse-', ''))}</td><td>${escapeHtml(u.type)}</td><td>${ghaBadge(ghaOf(u))}</td><td class="mono">${escapeHtml(u.serial)}</td>
+    <td class="mono">${escapeHtml(u.id.replace('gse-', ''))}</td><td>${escapeHtml(u.type)}</td><td>${ghaBadge(ghaOf(u))}</td><td>${ownBadge(u.ownership)}</td><td class="mono">${escapeHtml(u.serial)}</td>
     <td><span class="eq-status es-${stCls}">${u.status}</span></td>
     <td class="mono">${u.mtbfHours} h</td>
     <td class="mono">${fmtDate(u.lastService)}</td>
     <td class="mono ${overdue ? 'overdue-txt' : ''}">${fmtDate(u.nextServiceDue)}${overdue ? ' ⚠' : ''}</td>
+    ${equipPerfMiniRing(u, index)}
     <td class="mono">${Math.round(fp * 100)}%</td>
     <td class="th-act"><button class="kebab-btn" data-eqmenu="${u.id}" aria-label="Actions"><svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg></button></td>
   </tr>`;
@@ -3454,7 +5698,17 @@ function openEquipModal(id) {
   const curStatus = u ? u.status : 'SERVICEABLE';
   const curLast = u ? u.lastService.slice(0, 10) : nowISO().slice(0, 10);
   const curNext = u ? u.nextServiceDue.slice(0, 10) : addMinutesISO(nowISO(), 60 * 24 * 30).slice(0, 10);
-  const curGha = u ? ghaOf(u) : 'DNATA';
+  const ghasList = getGhas();
+  const curGha = u ? (ghaOf(u) || '') : (ghasList[0] ? ghasList[0].id : '');
+  const curOwnership = u ? (u.ownership || 'GHA') : 'GHA';
+  const curSuitable = u && u.suitableFor && u.suitableFor.length ? u.suitableFor : ['ALL'];
+  const curSuitIsAll = curSuitable.length === 1 && curSuitable[0] === 'ALL';
+  const fin = u ? (u.financial || {}) : {};
+  const curCost = fin.acquisitionCost != null ? fin.acquisitionCost : '';
+  const curAcqDate = fin.acquisitionDate ? fin.acquisitionDate.slice(0, 10) : nowISO().slice(0, 10);
+  const curLife = fin.usefulLifeYears != null ? fin.usefulLifeYears : 10;
+  const curFuelType = fin.fuelType || 'DIESEL';
+  const curFuelCost = fin.fuelCostPerHour != null ? fin.fuelCostPerHour : '';
 
   const modal = openModal(`
     <div class="modal-head">
@@ -3497,11 +5751,31 @@ function openEquipModal(id) {
         </div>
       </div>
 
-      <!-- OPERATING GROUND HANDLING AGENT -->
+      <!-- OPERATING GROUND HANDLING AGENT & OWNERSHIP -->
+      <div class="grid-2">
+        <div class="field">
+          <label for="eq-f-gha">Operating Ground Handling Agent (GHA)</label>
+          <div class="input-wrap">
+            <select id="eq-f-gha"><option value="">— Unassigned —</option>${ghasList.map(g => `<option value="${g.id}" ${curGha === g.id ? 'selected' : ''}>${escapeHtml(g.name)}</option>`).join('')}</select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="eq-f-ownership">Ownership</label>
+          <div class="input-wrap">
+            <select id="eq-f-ownership">
+              <option value="GHA" ${curOwnership === 'GHA' ? 'selected' : ''}>GHA-owned</option>
+              <option value="AIRPORT" ${curOwnership === 'AIRPORT' ? 'selected' : ''}>Airport-owned</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- AIRCRAFT SUITABILITY -->
       <div class="field">
-        <label for="eq-f-gha">Operating Ground Handling Agent (GHA)</label>
-        <div class="input-wrap">
-          <select id="eq-f-gha">${GHA_ORDER.map(id => `<option value="${id}" ${curGha === id ? 'selected' : ''}>${escapeHtml(GHAS[id].name)}</option>`).join('')}</select>
+        <label>Aircraft Suitability</label>
+        <div class="eq-type-chips" id="eq-suit-chips">
+          <button type="button" class="eq-chip ${curSuitIsAll ? 'active' : ''}" data-suit="ALL">Universal (ALL)</button>
+          ${AIRCRAFT_TYPE_LIST.map(a => `<button type="button" class="eq-chip ${!curSuitIsAll && curSuitable.includes(a) ? 'active' : ''}" data-suit="${escapeHtml(a)}">${escapeHtml(a)}</button>`).join('')}
         </div>
       </div>
 
@@ -3549,6 +5823,34 @@ function openEquipModal(id) {
           </div>
         </div>
       </div>
+
+      <!-- FINANCIAL DETAILS (collapsible) -->
+      <section class="audit-card" style="border:1px solid var(--border);border-radius:var(--r)">
+        <button class="audit-toggle" id="eq-fin-toggle" type="button">
+          <span>Financial details</span><span class="au-chev">▸</span></button>
+        <div class="audit-body" id="eq-fin-body" hidden>
+          <div class="grid-2">
+            <div class="field"><label for="eq-f-cost">Acquisition Cost</label>
+              <div class="input-wrap"><input type="number" id="eq-f-cost" value="${curCost}" placeholder="42000"/><span class="input-unit mono">USD</span></div></div>
+            <div class="field"><label for="eq-f-acqdate">Acquisition Date</label>
+              <div class="input-wrap"><input type="date" id="eq-f-acqdate" value="${curAcqDate}"/></div></div>
+          </div>
+          <div class="grid-2">
+            <div class="field"><label for="eq-f-life">Useful Life</label>
+              <div class="input-wrap"><input type="number" id="eq-f-life" value="${curLife}" placeholder="10"/><span class="input-unit mono">yrs</span></div></div>
+            <div class="field"><label for="eq-f-fueltype">Fuel Type</label>
+              <div class="input-wrap"><select id="eq-f-fueltype">
+                <option value="DIESEL" ${curFuelType === 'DIESEL' ? 'selected' : ''}>DIESEL</option>
+                <option value="ELECTRIC" ${curFuelType === 'ELECTRIC' ? 'selected' : ''}>ELECTRIC</option>
+                <option value="N/A" ${curFuelType === 'N/A' ? 'selected' : ''}>N/A (non-powered)</option>
+              </select></div></div>
+          </div>
+          <div class="field" id="eq-f-fuelcost-field" ${curFuelType !== 'DIESEL' ? 'hidden' : ''}>
+            <label for="eq-f-fuelcost">Fuel Cost / Hour</label>
+            <div class="input-wrap"><input type="number" id="eq-f-fuelcost" value="${curFuelCost}" placeholder="12" step="0.1"/><span class="input-unit mono">USD/hr</span></div>
+          </div>
+        </div>
+      </section>
     </div>
 
     <div class="modal-foot">
@@ -3567,12 +5869,37 @@ function openEquipModal(id) {
   });
 
   const typeInput = modal.querySelector('#eq-f-type');
-  const typeChips = modal.querySelectorAll('.eq-chip');
+  const typeChips = modal.querySelectorAll('#eq-type-chips .eq-chip');
   typeChips.forEach(c => c.onclick = () => {
     typeChips.forEach(x => x.classList.remove('active'));
     c.classList.add('active');
     typeInput.value = c.dataset.type;
   });
+
+  /* suitability chips: 'ALL' is exclusive, individual aircraft toggle and
+     fall back to 'ALL' the moment none are left selected */
+  const suitChips = modal.querySelectorAll('#eq-suit-chips .eq-chip');
+  const suitAllChip = modal.querySelector('#eq-suit-chips [data-suit="ALL"]');
+  suitChips.forEach(c => c.onclick = () => {
+    if (c.dataset.suit === 'ALL') {
+      suitChips.forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+    } else {
+      suitAllChip.classList.remove('active');
+      c.classList.toggle('active');
+      if (![...suitChips].some(x => x !== suitAllChip && x.classList.contains('active'))) suitAllChip.classList.add('active');
+    }
+  });
+
+  const finToggle = modal.querySelector('#eq-fin-toggle');
+  const finBody = modal.querySelector('#eq-fin-body');
+  finToggle.onclick = () => {
+    finBody.hidden = !finBody.hidden;
+    finToggle.classList.toggle('open', !finBody.hidden);
+  };
+  const fuelTypeSel = modal.querySelector('#eq-f-fueltype');
+  const fuelCostField = modal.querySelector('#eq-f-fuelcost-field');
+  fuelTypeSel.onchange = () => { fuelCostField.hidden = fuelTypeSel.value !== 'DIESEL'; };
 
   modal.querySelectorAll('.dp-preset').forEach(btn => {
     btn.onclick = () => {
@@ -3594,12 +5921,24 @@ function openEquipModal(id) {
     const mtbf = Number(modal.querySelector('#eq-f-mtbf').value) || 800;
     const last = modal.querySelector('#eq-f-last').value;
     const next = modal.querySelector('#eq-f-next').value;
-    const gha = modal.querySelector('#eq-f-gha').value;
+    const ghaId = modal.querySelector('#eq-f-gha').value || null;
+    const ownership = modal.querySelector('#eq-f-ownership').value;
+    const suitableFor = suitAllChip.classList.contains('active') ? ['ALL']
+      : [...suitChips].filter(c => c !== suitAllChip && c.classList.contains('active')).map(c => c.dataset.suit);
+    const acquisitionCost = Number(modal.querySelector('#eq-f-cost').value) || 0;
+    const acquisitionDateVal = modal.querySelector('#eq-f-acqdate').value;
+    const usefulLifeYears = Number(modal.querySelector('#eq-f-life').value) || 10;
+    const fuelType = fuelTypeSel.value;
+    const fuelCostPerHour = fuelType === 'DIESEL' ? (Number(modal.querySelector('#eq-f-fuelcost').value) || 0) : 0;
     if (!type || !serial) { showToast('Type and serial are required', 'error'); return; }
     const g = getGse();
+    const financial = {
+      acquisitionCost, acquisitionDate: acquisitionDateVal ? new Date(acquisitionDateVal).toISOString() : (fin.acquisitionDate || nowISO()),
+      usefulLifeYears, fuelType, fuelCostPerHour, maintenanceCostToDate: fin.maintenanceCostToDate || 0
+    };
     if (u) {
       Object.assign(g.find(x => x.id === id), {
-        type, serial, status, mtbfHours: mtbf, gha,
+        type, serial, status, mtbfHours: mtbf, ghaId, ownership, suitableFor, financial,
         lastService: last ? new Date(last).toISOString() : u.lastService,
         nextServiceDue: next ? new Date(next).toISOString() : u.nextServiceDue
       });
@@ -3607,7 +5946,8 @@ function openEquipModal(id) {
     } else {
       const code = (type.match(/\b\w/g) || ['G']).join('').toUpperCase().slice(0, 3);
       g.push({
-        id: 'gse-' + code + '-' + uid('n').slice(-4), typeCode: code, type, serial, status, mtbfHours: mtbf, gha,
+        id: 'gse-' + code + '-' + uid('n').slice(-4), typeCode: code, type, serial, status, mtbfHours: mtbf, ghaId, ownership, suitableFor, financial,
+        nonFinancial: { deploymentHoursThisMonth: 0, fuelConsumptionThisMonth: 0 },
         lastService: last ? new Date(last).toISOString() : nowISO(),
         nextServiceDue: next ? new Date(next).toISOString() : addMinutesISO(nowISO(), 60 * 24 * 30),
         maintLog: []
@@ -3615,47 +5955,1442 @@ function openEquipModal(id) {
       logActivity({ action: `added unit ${serial}`, target: type, category: 'equipment', severity: 'success' });
     }
     saveGse(g); closeModal(); showToast(`${serial} ${u ? 'updated' : 'added'}`, 'success'); renderEquipmentBody();
+    if (equipDetailOpenId === id) openEquipDetail(id);
   };
 }
 
-function openMaintDrawer(id) {
+let equipDrawerTab = 'overview';
+function equipOverviewTabHtml(u, gha, viewAgentBtn, log) {
+  return `<div class="dw-grid">
+      <div class="dw-item"><div class="k">Type</div><div class="v">${escapeHtml(u.type)}</div></div>
+      <div class="dw-item"><div class="k">Operator (GHA)</div><div class="v">${escapeHtml(gha ? gha.name : 'Unassigned')}${viewAgentBtn}</div></div>
+      <div class="dw-item"><div class="k">Ownership</div><div class="v">${ownBadge(u.ownership)}</div></div>
+      <div class="dw-item"><div class="k">Status</div><div class="v">${u.status}</div></div>
+      <div class="dw-item"><div class="k">MTBF</div><div class="v mono">${u.mtbfHours} h</div></div>
+      <div class="dw-item"><div class="k">Fail prob</div><div class="v mono">${Math.round(unitFailureProb(u) * 100)}%</div></div>
+    </div>
+    <div class="dw-section"><h4>Add log entry</h4>
+      <div class="grid-2"><div class="field"><label>Date</label><div class="input-wrap"><input type="date" id="ml-date" value="${nowISO().slice(0, 10)}"/></div></div>
+        <div class="field"><label>Hours</label><div class="input-wrap"><input type="text" id="ml-hours" placeholder="2"/></div></div></div>
+      <div class="field"><label>Type</label><div class="input-wrap"><input type="text" id="ml-type" placeholder="Scheduled service"/></div></div>
+      <div class="field"><label>Notes</label><textarea id="ml-notes" placeholder="Work performed…"></textarea></div>
+      <button class="btn btn-primary btn-sm" id="ml-add" type="button">Add entry</button>
+    </div>
+    <div class="dw-section"><h4>Service history</h4>
+      <div id="ml-list">${log.length ? log.map(m => `<div class="ml-row"><div class="ml-top"><span class="mono">${fmtDate(m.date)}</span><span class="ml-hrs mono">${m.hours || 0}h</span></div>
+        <div class="ml-type">${escapeHtml(m.type)}</div>${m.notes ? `<div class="ml-notes">${escapeHtml(m.notes)}</div>` : ''}</div>`).join('') : '<p style="font-size:12.5px;color:var(--text-mute)">No service history recorded.</p>'}</div>
+    </div>`;
+}
+function equipFinancialTabHtml(u) {
+  const f = u.financial || {};
+  const hasFuel = f.fuelType && f.fuelType !== 'N/A';
+  return `<div class="dw-section" style="margin-top:0">
+      <h4>Book value</h4>
+      <div class="tobt-big mono">${fmtMoney(currentBookValue(u))}</div>
+      <div class="an-chart">${bookValueChartSVG(u)}</div>
+    </div>
+    <div class="dw-grid">
+      <div class="dw-item"><div class="k">Acquisition cost</div><div class="v mono">${fmtMoney(f.acquisitionCost || 0)}</div></div>
+      <div class="dw-item"><div class="k">Acquisition date</div><div class="v mono">${fmtDate(f.acquisitionDate)}</div></div>
+      <div class="dw-item"><div class="k">Useful life</div><div class="v mono">${f.usefulLifeYears || 0} yrs</div></div>
+      <div class="dw-item"><div class="k">Maintenance cost to date</div><div class="v mono">${fmtMoney(f.maintenanceCostToDate || 0)}</div></div>
+      ${hasFuel ? `<div class="dw-item"><div class="k">Fuel type</div><div class="v">${escapeHtml(f.fuelType)}</div></div>
+      <div class="dw-item"><div class="k">Fuel cost / hour</div><div class="v mono">${fmtMoney(f.fuelCostPerHour || 0)}</div></div>` : ''}
+    </div>`;
+}
+function equipDecayChartSVG(u) {
+  const f = u.financial || {};
+  const ps = (u.nonFinancial && u.nonFinancial.performanceScore) || {};
+  const curve = ps.curveUsed || { yearlyDeclinePercent: 8, floorPercent: 35 };
+  const life = f.usefulLifeYears || 10;
+  const floor = curve.floorPercent;
+  const ageYears = ps.ageYears || 0;
+  const unitScore = ps.finalScore || 0;
+
+  // Visual dimension setup
+  const W = 380, H = 175, padL = 36, padR = 16, padT = 28, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const x = yrs => padL + (yrs / life) * plotW;
+  const y = val => padT + (1 - (val / 100)) * plotH;
+
+  // Determine dynamic accent color
+  const accent = unitScore >= 80 ? '#10B981' : unitScore >= 50 ? '#F59E0B' : '#EF4444';
+  const gradId = 'edc-g-' + (u.id || 'unit').replace(/[^a-zA-Z0-9]/g, '');
+
+  // Calculate smooth decay curve points
+  const steps = 40;
+  const curvePts = [];
+  for (let i = 0; i <= steps; i++) {
+    const yr = (i / steps) * life;
+    const val = Math.max(floor, 100 - yr * curve.yearlyDeclinePercent);
+    curvePts.push([x(yr), y(val)]);
+  }
+
+  // Polygon area under the curve
+  const areaPts = [[x(0), y(floor)], ...curvePts, [x(life), y(floor)]];
+
+  // Coordinates for the current unit's position
+  const dotX = x(Math.min(ageYears, life));
+  const dotY = y(unitScore);
+  const midX = x(life / 2);
+  const endX = W - padR;
+
+  // Y-axis grid levels
+  const gridVals = [100, 75, 50, floor];
+  const gridLines = gridVals.map(v => {
+    const isFloor = v === floor;
+    const strokeStyle = isFloor ? 'stroke="rgba(239, 68, 68, 0.45)" stroke-dasharray="4,3"' : 'class="tl-grid"';
+    const textStyle = isFloor ? 'style="fill:var(--red);font-weight:600"' : 'class="an-axis mono"';
+    return `<line x1="${padL}" y1="${y(v).toFixed(1)}" x2="${W - padR}" y2="${y(v).toFixed(1)}" ${strokeStyle}/>
+      <text x="${padL - 4}" y="${(y(v) + 3).toFixed(1)}" text-anchor="end" ${textStyle} font-size="9.5">${v}%</text>`;
+  }).join('');
+
+  // Callout pill positioning (prevent clipping on edges)
+  const pillW = 96, pillH = 21;
+  let pillX = dotX - pillW / 2;
+  if (pillX < padL + 2) pillX = padL + 2;
+  if (pillX + pillW > W - padR - 2) pillX = W - padR - pillW - 2;
+  const pillY = dotY - 26 < padT - 6 ? dotY + 12 : dotY - 26;
+
+  // Safe buffer delta
+  const bufferDelta = Math.max(0, unitScore - floor);
+
+  return `<div class="eq-decay-card">
+    <div class="edc-head">
+      <div>
+        <span class="edc-title">Lifecycle Reliability Trajectory</span>
+        <span class="edc-sub">Category: ${escapeHtml(u.category || 'GSE')} · ${curve.yearlyDeclinePercent}%/yr nominal decline</span>
+      </div>
+      <div class="edc-badges">
+        <span class="edc-tag floor">Floor: ${floor}%</span>
+        <span class="edc-tag status" style="--tag-c:${accent}">Score: ${unitScore}%</span>
+      </div>
+    </div>
+
+    <div class="edc-svg-wrap">
+      <svg viewBox="0 0 ${W} ${H}" width="100%" class="edc-svg">
+        <defs>
+          <linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="${accent}" stop-opacity="0.32"/>
+            <stop offset="70%" stop-color="${accent}" stop-opacity="0.08"/>
+            <stop offset="100%" stop-color="${accent}" stop-opacity="0.01"/>
+          </linearGradient>
+        </defs>
+
+        <!-- Background grid & Floor -->
+        ${gridLines}
+        <text x="${padL + 6}" y="${(y(floor) - 4).toFixed(1)}" text-anchor="start" class="mono" font-size="8.5" font-weight="600" fill="var(--red)" opacity="0.85">Safety Floor (${floor}%)</text>
+
+        <!-- Area fill & Line -->
+        <path d="${polyPath(areaPts)} Z" fill="url(#${gradId})"/>
+        <path d="${polyPath(curvePts)}" fill="none" stroke="${accent}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+        <!-- Crosshair guides to current position -->
+        <line x1="${dotX.toFixed(1)}" y1="${dotY.toFixed(1)}" x2="${dotX.toFixed(1)}" y2="${(H - padB).toFixed(1)}" stroke="${accent}" stroke-width="1.2" stroke-dasharray="3,3" opacity="0.7"/>
+        <line x1="${padL}" y1="${dotY.toFixed(1)}" x2="${dotX.toFixed(1)}" y2="${dotY.toFixed(1)}" stroke="${accent}" stroke-width="1.2" stroke-dasharray="3,3" opacity="0.4"/>
+
+        <!-- Axis landing indicator for current position -->
+        <circle cx="${dotX.toFixed(1)}" cy="${(H - padB).toFixed(1)}" r="3" fill="${accent}"/>
+
+        <!-- Baseline X axis -->
+        <line x1="${padL}" y1="${(H - padB).toFixed(1)}" x2="${W - padR}" y2="${(H - padB).toFixed(1)}" stroke="var(--border)" stroke-width="1.2"/>
+        <line x1="${padL}" y1="${(H - padB).toFixed(1)}" x2="${padL}" y2="${(H - padB + 4).toFixed(1)}" stroke="var(--border)" stroke-width="1.2"/>
+        <line x1="${midX.toFixed(1)}" y1="${(H - padB).toFixed(1)}" x2="${midX.toFixed(1)}" y2="${(H - padB + 4).toFixed(1)}" stroke="var(--border)" stroke-width="1.2"/>
+        <line x1="${endX.toFixed(1)}" y1="${(H - padB).toFixed(1)}" x2="${endX.toFixed(1)}" y2="${(H - padB + 4).toFixed(1)}" stroke="var(--border)" stroke-width="1.2"/>
+
+        <!-- Clean, Fixed X-axis Milestone Labels (Zero Collision) -->
+        <text x="${padL}" y="${H - 9}" class="an-axis mono" font-size="9">0y</text>
+        <text x="${midX.toFixed(1)}" y="${H - 9}" text-anchor="middle" class="an-axis mono" font-size="9">${(life / 2).toFixed(0)}y</text>
+        <text x="${endX.toFixed(1)}" y="${H - 9}" text-anchor="end" class="an-axis mono" font-size="9">${life}y Max</text>
+
+        <!-- Active Unit Beacon & Pulse -->
+        <circle cx="${dotX.toFixed(1)}" cy="${dotY.toFixed(1)}" r="10" fill="${accent}" opacity="0.22" class="eq-decay-pulse"/>
+        <circle cx="${dotX.toFixed(1)}" cy="${dotY.toFixed(1)}" r="5.5" fill="var(--surface)" stroke="${accent}" stroke-width="2.5"/>
+        <circle cx="${dotX.toFixed(1)}" cy="${dotY.toFixed(1)}" r="2.5" fill="${accent}"/>
+
+        <!-- Telemetry Callout Pill (High Contrast, Self-Contained) -->
+        <rect x="${pillX.toFixed(1)}" y="${pillY.toFixed(1)}" width="${pillW}" height="${pillH}" rx="4" fill="var(--surface-alt)" stroke="var(--border)" stroke-width="1" filter="drop-shadow(0 2px 4px rgba(0,0,0,0.12))"/>
+        <circle cx="${(pillX + 8).toFixed(1)}" cy="${(pillY + 10.5).toFixed(1)}" r="3.2" fill="${accent}"/>
+        <text x="${(pillX + 16).toFixed(1)}" y="${(pillY + 14).toFixed(1)}" class="mono" font-size="10.5" font-weight="700" fill="var(--text)">${unitScore}% · ${ageYears}y</text>
+      </svg>
+    </div>
+
+    <div class="edc-foot">
+      <div class="edc-foot-item"><span class="edc-k">Asset Lifespan</span><span class="edc-v mono">${ageYears} / ${life} yrs (${Math.round((ageYears / life) * 100)}%)</span></div>
+      <div class="edc-foot-item"><span class="edc-k">Safety Margin</span><span class="edc-v mono ${unitScore > floor + 10 ? 'good' : 'warn'}">+${bufferDelta}% above floor</span></div>
+      <div class="edc-foot-item"><span class="edc-k">Active Adjustments</span><span class="edc-v">${ps.maintenanceBonusApplied ? '<span class="epb-v bonus">✓ +3% Maint</span>' : '<span class="epb-v neutral">Standard</span>'} ${ps.reactivationPenaltyApplied ? '<span class="epb-v penalty">⚠ -10% React</span>' : ''}</span></div>
+    </div>
+  </div>`;
+}
+
+function equipPerformanceTabHtml(u) {
+  const nf = u.nonFinancial || { deploymentHoursThisMonth: 0, fuelConsumptionThisMonth: 0 };
+  const f = u.financial || {};
+  const showFuel = f.fuelType === 'DIESEL';
+  const ps = nf.performanceScore;
+  const score = ps ? ps.finalScore : 0;
+  const gr = equipGrade(score);
+  const scoreColor = score >= 80 ? 'var(--green)' : score >= 60 ? '#0D9488' : score >= 40 ? 'var(--amber)' : 'var(--red)';
+  const colorClass = score >= 80 ? 'perf-score-green' : score >= 50 ? 'perf-score-amber' : 'perf-score-red';
+  const ratingTier = gr.tier;
+  
+  // Use perfRingHtml pattern for the large ring but with equipment score bands
+  const ringSize = 72, ringFontSize = 20;
+  const ringStroke = Math.max(5, Math.round(ringSize * 0.09));
+  const ringR = ringSize / 2 - ringStroke, ringCIRC = 2 * Math.PI * ringR;
+  const ringFrac = ENGINE.clamp(score, 0, 100) / 100;
+  
+  const ringHtml = `<div class="perf-ring-wrap" style="width:${ringSize}px;height:${ringSize}px">
+    <svg viewBox="0 0 ${ringSize} ${ringSize}" width="${ringSize}" height="${ringSize}">
+      <circle cx="${ringSize/2}" cy="${ringSize/2}" r="${ringR}" fill="none" stroke="var(--surface-alt)" stroke-width="${ringStroke}"/>
+      <circle class="perf-ring-fill" cx="${ringSize/2}" cy="${ringSize/2}" r="${ringR}" fill="none" stroke="${scoreColor}" stroke-width="${ringStroke}" stroke-linecap="round"
+        transform="rotate(-90 ${ringSize/2} ${ringSize/2})" stroke-dasharray="${ringCIRC.toFixed(1)}" stroke-dashoffset="${ringCIRC.toFixed(1)}"
+        data-target="${(ringCIRC * (1 - ringFrac)).toFixed(1)}"/>
+    </svg>
+    <div class="perf-ring-num mono" style="font-size:${ringFontSize}px;color:${scoreColor}">${score}</div>
+  </div>`;
+
+  const config = getActiveEquipPerfConfig().params;
+  const curve = ps ? ps.curveUsed : { yearlyDeclinePercent: 8, floorPercent: 35 };
+  const ageDecayTotal = ps ? +(ps.ageYears * curve.yearlyDeclinePercent).toFixed(1) : 0;
+  const isFloorClamped = ps ? (100 - ageDecayTotal) < curve.floorPercent : false;
+
+  // Natural language summary of why this score was reached
+  let narrative = '';
+  if (ps) {
+    const parts = [];
+    parts.push(`Started at 100% baseline`);
+    parts.push(`lost ${ageDecayTotal}% across ${ps.ageYears} yrs of operational life`);
+    if (ps.maintenanceBonusApplied) parts.push(`gained +${config.maintenanceBonusPercent}% for recent preventive maintenance`);
+    if (ps.reactivationPenaltyApplied) parts.push(`deducted -${config.reactivationPenaltyPercent}% risk penalty for recent post-repair reactivation`);
+    if (isFloorClamped) parts.push(`protected by ${curve.floorPercent}% safety floor`);
+    narrative = parts.join(', ') + '.';
+  }
+
+  const decayChart = ps ? equipDecayChartSVG(u) : '';
+
+  return `<div class="dw-section" style="margin-top:0">
+      <div class="eq-perf-headline">
+        ${ringHtml}
+        <div>
+          <div class="eq-perf-score-label ${colorClass}">Equipment Performance Score</div>
+          <div class="eq-modal-grade-wrap">
+            <span class="grade-badge ${gr.class}">${gr.label}</span>
+            <span class="eq-modal-grade-desc">${escapeHtml(gr.meaning)}</span>
+          </div>
+          <div class="eq-perf-score-sub" style="margin-top:4px">${escapeHtml(u.type)} · ${ps ? escapeHtml(ps.category) : 'N/A'} · <span class="mono" style="font-weight:600">${ratingTier}</span></div>
+          <p style="font-size:11.5px;color:var(--text-mute);margin:5px 0 0;line-height:1.4">${escapeHtml(narrative)}</p>
+        </div>
+      </div>
+
+      ${ps ? `
+      <!-- STEP-BY-STEP CALCULATION LEDGER -->
+      <div style="margin-top:14px">
+        <h4 style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-mute);margin-bottom:8px">Score Derivation Ledger (How this score was calculated)</h4>
+        <div class="eq-ledger-card">
+          <div class="elc-row">
+            <div class="elc-icon">📦</div>
+            <div class="elc-info">
+              <span class="elc-name">1. Brand New Baseline (Year 0)</span>
+              <span class="elc-sub">Full factory standard operational capability</span>
+            </div>
+            <div class="elc-val mono good">+100.0%</div>
+          </div>
+
+          <div class="elc-row">
+            <div class="elc-icon">⏳</div>
+            <div class="elc-info">
+              <span class="elc-name">2. Natural Age Wear & Tear</span>
+              <span class="elc-sub">${ps.ageYears} yrs active × ${curve.yearlyDeclinePercent}%/yr nominal decline for ${escapeHtml(ps.category)}</span>
+            </div>
+            <div class="elc-val mono bad">−${ageDecayTotal.toFixed(1)}%</div>
+          </div>
+
+          <div class="elc-row">
+            <div class="elc-icon">🔧</div>
+            <div class="elc-info">
+              <span class="elc-name">3. 90-Day Preventive Service Bonus</span>
+              <span class="elc-sub">${ps.maintenanceBonusApplied ? 'Active bonus: Routine preventive maintenance logged within last 90 days' : 'No service entry logged in last 90 days'}</span>
+            </div>
+            <div class="elc-val mono ${ps.maintenanceBonusApplied ? 'bonus' : 'neutral'}">${ps.maintenanceBonusApplied ? `+${config.maintenanceBonusPercent}.0%` : '0.0%'}</div>
+          </div>
+
+          <div class="elc-row">
+            <div class="elc-icon">⚠️</div>
+            <div class="elc-info">
+              <span class="elc-name">4. 30-Day Post-Repair Risk Penalty</span>
+              <span class="elc-sub">${ps.reactivationPenaltyApplied ? 'Active penalty: Corrective overhaul/repair logged within last 30 days' : 'Zero recent breakdowns — systems operating stably'}</span>
+            </div>
+            <div class="elc-val mono ${ps.reactivationPenaltyApplied ? 'penalty' : 'neutral'}">${ps.reactivationPenaltyApplied ? `−${config.reactivationPenaltyPercent}.0%` : '0.0%'}</div>
+          </div>
+
+          ${isFloorClamped ? `
+          <div class="elc-row">
+            <div class="elc-icon">🛡️</div>
+            <div class="elc-info">
+              <span class="elc-name">5. Safety Floor Protection</span>
+              <span class="elc-sub">Protected by regulatory operational baseline minimum of ${curve.floorPercent}%</span>
+            </div>
+            <div class="elc-val mono warn">Floor ${curve.floorPercent}%</div>
+          </div>` : ''}
+
+          <div class="elc-total">
+            <div>
+              <div class="elc-tot-lbl">Derived Performance Score</div>
+              <span class="grade-badge ${gr.class}" style="margin-top:3px">${gr.label} (${score}%)</span>
+            </div>
+            <div class="elc-tot-val mono ${colorClass}">${ps.finalScore}%</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CONTRIBUTING DRIVERS & OPERATIONAL GUIDANCE -->
+      <div class="eq-guide-grid">
+        <div class="egg-card ${ps.maintenanceBonusApplied ? 'ok' : 'action'}">
+          <span class="egg-tag ${ps.maintenanceBonusApplied ? 'ok' : 'action'}">${ps.maintenanceBonusApplied ? 'Bonus Active' : 'Action Required'}</span>
+          <div class="egg-title">Maintenance Standing</div>
+          <p class="egg-text">${ps.maintenanceBonusApplied ? `Unit is rewarded with +${config.maintenanceBonusPercent}% bonus for active scheduled servicing.` : `Log a routine inspection or service to grant this unit a +${config.maintenanceBonusPercent}% performance boost.`}</p>
+        </div>
+        <div class="egg-card ${ps.reactivationPenaltyApplied ? 'warn' : 'ok'}">
+          <span class="egg-tag ${ps.reactivationPenaltyApplied ? 'warn' : 'ok'}">${ps.reactivationPenaltyApplied ? 'Penalty Active' : 'Stable Ops'}</span>
+          <div class="egg-title">Breakdown Risk</div>
+          <p class="egg-text">${ps.reactivationPenaltyApplied ? `Under observation after corrective repair. Penalty automatically clears 30 days post-repair.` : `No corrective repairs logged recently. Machine running reliably with 0% risk penalty.`}</p>
+        </div>
+      </div>
+      ` : ''}
+
+      ${decayChart}
+    </div>
+    <div class="dw-section">
+      <h4>Deployment this month</h4>
+      ${utilisationBarHtml(nf.deploymentHoursThisMonth)}
+    </div>
+    ${showFuel ? `<div class="dw-section"><h4>Fuel consumption this month</h4>
+      <div class="v mono" style="font-size:15px">${nf.fuelConsumptionThisMonth} L</div></div>` : ''}
+    <div class="dw-section"><h4>Aircraft suitability</h4>
+      <div class="dw-perms">${suitabilityTagsHtml(u)}</div>
+    </div>`;
+}
+let equipDetailOpenId = null;
+let equipDetailTab = 'overview';
+
+function equipStatusBadge(status) {
+  const cls = { SERVICEABLE: 'b-approved', MAINTENANCE: 'b-pending', UNSERVICEABLE: 'b-suspended', RETIRED: 'b-suspended' }[status] || 'b-pending';
+  return `<span class="badge ${cls}"><span class="dot"></span>${status}</span>`;
+}
+
+function openEquipDetail(id) {
   const u = getGse().find(x => x.id === id); if (!u) return;
-  const log = (u.maintLog || []).slice().sort((a, b) => new Date(b.date) - new Date(a.date));
-  openGenericDrawer(`
-    <div class="drawer-head"><h3 style="font-size:15px;font-weight:700">${escapeHtml(u.serial)} · maintenance</h3>
-      <button class="modal-x" data-x aria-label="Close"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6 L18 18 M18 6 L6 18"/></svg></button></div>
-    <div class="drawer-body">
-      <div class="dw-grid">
-        <div class="dw-item"><div class="k">Type</div><div class="v">${escapeHtml(u.type)}</div></div>
-        <div class="dw-item"><div class="k">Operator (GHA)</div><div class="v">${escapeHtml(GHAS[ghaOf(u)].name)}</div></div>
-        <div class="dw-item"><div class="k">Status</div><div class="v">${u.status}</div></div>
-        <div class="dw-item"><div class="k">MTBF</div><div class="v mono">${u.mtbfHours} h</div></div>
-        <div class="dw-item"><div class="k">Fail prob</div><div class="v mono">${Math.round(unitFailureProb(u) * 100)}%</div></div>
+  const ghaId = ghaOf(u);
+  const gha = getGha(ghaId);
+  const color = ghaColorFor(ghaId);
+  const catIcon = { POWERED: '⚡', NON_POWERED: '📦', INFRASTRUCTURE: '🏗' }[u.category] || '⚙';
+  const canEdit = hasPermission('equipment');
+
+  equipDetailOpenId = id;
+  const modal = openModal(`
+    <div class="modal-head">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div class="drawer-avatar" style="width:40px;height:40px;font-size:16px;margin-bottom:0;background:color-mix(in srgb, ${color} 16%, transparent);color:${color}">${catIcon}</div>
+        <div>
+          <h3 style="font-size:17px;font-weight:700">${escapeHtml(u.type)} — <span class="mono">${escapeHtml(u.serial)}</span></h3>
+          <p class="mono" style="font-size:12px;color:var(--text-mute);margin-top:2px">${escapeHtml(u.category)} · Operator: ${escapeHtml(gha ? gha.name : 'Unassigned')}</p>
+        </div>
       </div>
-      <div class="dw-section"><h4>Add log entry</h4>
-        <div class="grid-2"><div class="field"><label>Date</label><div class="input-wrap"><input type="date" id="ml-date" value="${nowISO().slice(0, 10)}"/></div></div>
-          <div class="field"><label>Hours</label><div class="input-wrap"><input type="text" id="ml-hours" placeholder="2"/></div></div></div>
-        <div class="field"><label>Type</label><div class="input-wrap"><input type="text" id="ml-type" placeholder="Scheduled service"/></div></div>
-        <div class="field"><label>Notes</label><textarea id="ml-notes" placeholder="Work performed…"></textarea></div>
-        <button class="btn btn-primary btn-sm" id="ml-add" type="button">Add entry</button>
+      <div style="display:flex;align-items:center;gap:8px">
+        ${canEdit ? `<button class="btn btn-ghost btn-xs" id="eq-modal-edit" type="button">Edit unit</button>` : ''}
+        <button class="modal-x" data-x aria-label="Close"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6 L18 18 M18 6 L6 18"/></svg></button>
       </div>
-      <div class="dw-section"><h4>Service history</h4>
-        <div id="ml-list">${log.length ? log.map(m => `<div class="ml-row"><div class="ml-top"><span class="mono">${fmtDate(m.date)}</span><span class="ml-hrs mono">${m.hours || 0}h</span></div>
-          <div class="ml-type">${escapeHtml(m.type)}</div>${m.notes ? `<div class="ml-notes">${escapeHtml(m.notes)}</div>` : ''}</div>`).join('') : '<p style="font-size:12.5px;color:var(--text-mute)">No service history recorded.</p>'}</div>
-      </div>
-    </div>`);
-  const host = document.getElementById('drawer-host');
-  host.querySelector('#ml-add').onclick = () => {
-    const date = host.querySelector('#ml-date').value, hours = Number(host.querySelector('#ml-hours').value) || 0;
-    const type = host.querySelector('#ml-type').value.trim() || 'Service', notes = host.querySelector('#ml-notes').value.trim();
-    const g = getGse(); const unit = g.find(x => x.id === id);
-    unit.maintLog = unit.maintLog || []; unit.maintLog.push({ date: date ? new Date(date).toISOString() : nowISO(), type, notes, hours });
-    unit.lastService = date ? new Date(date).toISOString() : nowISO();
-    saveGse(g);
-    logActivity({ action: `logged maintenance on ${unit.serial}`, target: type, category: 'equipment', severity: 'info' });
-    showToast('Maintenance entry added', 'success');
-    openMaintDrawer(id);
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:-8px 0 16px">
+      ${equipStatusBadge(u.status)}
+      ${ownBadge(u.ownership)}
+      <span class="role-badge" style="font-size:11px">${escapeHtml(u.category)}</span>
+    </div>
+
+    <div class="gse-cat-tabs" id="eq-modal-tabs" style="margin-bottom:14px">
+      <button type="button" class="gct-tab ${equipDetailTab === 'overview' ? 'active' : ''}" data-eqtab="overview">Overview & Service</button>
+      <button type="button" class="gct-tab ${equipDetailTab === 'financial' ? 'active' : ''}" data-eqtab="financial">Financial</button>
+      <button type="button" class="gct-tab ${equipDetailTab === 'performance' ? 'active' : ''}" data-eqtab="performance">Performance</button>
+    </div>
+    <div id="eq-detail-content"></div>`, true);
+  modal.classList.add('equip-detail-modal');
+
+  const closeEquipDetail = () => { equipDetailOpenId = null; closeModal(); };
+  const host = document.getElementById('modal-host');
+  host.onclick = e => { if (e.target === host) closeEquipDetail(); };
+  modal.querySelectorAll('[data-x]').forEach(b => b.onclick = closeEquipDetail);
+
+  const editBtn = modal.querySelector('#eq-modal-edit');
+  if (editBtn) editBtn.onclick = () => openEquipModal(id);
+
+  modal.querySelector('#eq-modal-tabs').onclick = e => {
+    const b = e.target.closest('[data-eqtab]'); if (!b || b.dataset.eqtab === equipDetailTab) return;
+    equipDetailTab = b.dataset.eqtab;
+    modal.querySelectorAll('[data-eqtab]').forEach(x => x.classList.toggle('active', x === b));
+    paintEquipDetailTab(u, modal);
   };
+
+  paintEquipDetailTab(u, modal);
+}
+
+function paintEquipDetailTab(u, modal) {
+  const id = u.id;
+  const currentUnit = getGse().find(x => x.id === id) || u;
+  const log = (currentUnit.maintLog || []).slice().sort((a, b) => new Date(b.date) - new Date(a.date));
+  const ghaId = ghaOf(currentUnit);
+  const gha = getGha(ghaId);
+  const viewAgentBtn = (gha && hasPermission('gha'))
+    ? ` <button class="btn btn-ghost btn-xs" id="ml-view-agent" type="button" style="margin-left:6px">View agent</button>` : '';
+
+  const tabHtml = equipDetailTab === 'financial' ? equipFinancialTabHtml(currentUnit)
+    : equipDetailTab === 'performance' ? equipPerformanceTabHtml(currentUnit)
+      : equipOverviewTabHtml(currentUnit, gha, viewAgentBtn, log);
+
+  modal.querySelector('#eq-detail-content').innerHTML = tabHtml;
+
+  if (equipDetailTab === 'performance') {
+    animatePerfRings(modal);
+  }
+
+  if (equipDetailTab === 'overview') {
+    const viewAgentEl = modal.querySelector('#ml-view-agent');
+    if (viewAgentEl) viewAgentEl.onclick = () => openGhaDetail(ghaId);
+
+    const addBtn = modal.querySelector('#ml-add');
+    if (addBtn) {
+      addBtn.onclick = () => {
+        const date = modal.querySelector('#ml-date').value, hours = Number(modal.querySelector('#ml-hours').value) || 0;
+        const type = modal.querySelector('#ml-type').value.trim() || 'Service', notes = modal.querySelector('#ml-notes').value.trim();
+        const g = getGse(); const unit = g.find(x => x.id === id);
+        if (!unit) return;
+        unit.maintLog = unit.maintLog || [];
+        unit.maintLog.push({ date: date ? new Date(date).toISOString() : nowISO(), type, notes, hours });
+        unit.lastService = date ? new Date(date).toISOString() : nowISO();
+        if (unit.financial) unit.financial.maintenanceCostToDate = (unit.financial.maintenanceCostToDate || 0) + Math.round(150 + hours * 45);
+        saveGse(g);
+        recomputeAllEquipmentScores();
+        logActivity({ action: `logged maintenance on ${unit.serial}`, target: type, category: 'equipment', severity: 'info' });
+        showToast('Maintenance entry added', 'success');
+        paintEquipDetailTab(unit, modal);
+        renderEquipmentBody();
+      };
+    }
+  }
+}
+
+function openMaintDrawer(id) {
+  openEquipDetail(id);
+}
+
+/* ═══ S7b — GHA MANAGEMENT (key: gha) ═══════════════════════
+   Ground Handling Agents as a first-class entity — inventory and
+   management only. Performance scoring / GHO certification are later
+   prompts that extend this data model, not this pass. */
+let ghaLoaded = false;
+let ghaListFilter = { q: '', status: 'ALL', ownership: 'ALL' };
+let ghaReassignSelection = new Set();
+
+function ghaStatusBadge(status) {
+  const cls = { ACTIVE: 'b-approved', SUSPENDED: 'b-pending', TERMINATED: 'b-suspended' }[status] || 'b-suspended';
+  return `<span class="badge ${cls}"><span class="dot"></span>${status}</span>`;
+}
+function ghaOwnershipBadge(ownership) {
+  return `<span class="role-badge">${ownership === 'AIRPORT_SUBSIDIARY' ? 'Airport Subsidiary' : 'Private'}</span>`;
+}
+function ghaContractFlagHtml(g) {
+  const { state, daysLeft } = ghaContractState(g);
+  if (state === 'expired') return `<span class="orc-err bad mono">Expired ${Math.abs(daysLeft)}d ago</span>`;
+  if (state === 'expiring') return `<span class="orc-err warn mono">Expiring in ${daysLeft}d</span>`;
+  return `<span class="orc-err good mono">${daysLeft}d remaining</span>`;
+}
+
+function renderGhaManagement(el) {
+  if (!ghaLoaded) {
+    el.innerHTML = `<div id="gha-skeleton"><div class="sk sk-banner"></div>
+      <div class="sk-strip"><div class="sk sk-tile"></div><div class="sk sk-tile"></div><div class="sk sk-tile"></div><div class="sk sk-tile"></div></div>
+      <div class="sk sk-block"></div></div>`;
+    setTimeout(() => { ghaLoaded = true; paintGhaManagement(el); }, LOAD_DELAY);
+    return;
+  }
+  paintGhaManagement(el);
+}
+
+function ghaCardHtml(g, i, perfConfig) {
+  const color = ghaColorFor(g.id);
+  const { cats, total } = ghaFleetBreakdown(g.id);
+  const catRows = [['POWERED', '⚡ Powered'], ['NON_POWERED', '📦 Non-powered'], ['INFRASTRUCTURE', '🏗 Infrastructure']]
+    .map(([k, label]) => {
+      const pct = total ? Math.round(cats[k] / total * 100) : 0;
+      return `<div class="grc-row"><span class="grc-lbl">${label}</span>
+        <span class="grc-bar"><span style="width:${pct}%;background:${color}"></span></span>
+        <span class="mono grc-val">${cats[k]}</span></div>`;
+    }).join('');
+  const rec = getGhaPerfRecord(g.id, currentPeriod());
+  const threshold = perfConfig.params.minimumThreshold;
+  const perfBadge = rec ? `<div class="ghc-perf-mini" title="Overall performance score — ${rec.overallScore}/100">${perfRingHtml(rec.overallScore, threshold, 38, 12)}</div>` : '';
+  return `<div class="gha-card card-stagger ${rec && rec.belowMinimum ? 'perf-flagged' : ''}" data-gha-id="${g.id}" style="--gha:${color};animation-delay:${i * 40}ms">
+    <div class="ghc-top" style="align-items:flex-start">
+      <div><span class="ghc-name" style="font-size:15px">${escapeHtml(g.name)}</span>
+        <div style="margin-top:5px;display:flex;gap:6px;flex-wrap:wrap">${ghaStatusBadge(g.status)}${ghaOwnershipBadge(g.ownership)}${ghoBadgeHtml(g.id)}</div></div>
+      <div style="display:flex;align-items:center;gap:8px;flex:0 0 auto">
+        ${perfBadge}
+        <span class="gha-badge" style="--gha:${color}">${escapeHtml(g.code)}</span>
+        <button class="kebab-btn" data-kebab="${g.id}" aria-label="Actions" type="button"><svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg></button>
+      </div>
+    </div>
+    ${rec && rec.belowMinimum ? `<div class="perf-warn-chip mono">⚠ Below minimum performance (${rec.overallScore}/${threshold})</div>` : ''}
+    <div class="gr-cats" style="margin-top:12px">${total ? catRows : '<p class="rs-none">No equipment assigned.</p>'}</div>
+    <div class="dw-perms" style="margin-top:10px">${g.airlinesServed && g.airlinesServed.length ? g.airlinesServed.map(a => `<span class="dw-perm">${escapeHtml(a)}</span>`).join('') : '<span class="mono" style="font-size:11px;color:var(--text-mute)">No scheduled airlines</span>'}</div>
+    <div class="ghc-foot" style="margin-top:12px;justify-content:space-between">
+      <span class="mono ghc-units">${total} unit${total === 1 ? '' : 's'}</span>
+      ${ghaContractFlagHtml(g)}
+    </div>
+  </div>`;
+}
+
+let ghaModuleTab = 'agents';
+
+function ghaWarningBannerHtml(warnings) {
+  return `<div class="perf-warn-banner">
+    <span class="pwb-dot"></span>
+    <div class="pwb-text"><strong>${warnings.length} agent${warnings.length === 1 ? '' : 's'} below minimum performance.</strong>
+      ${warnings.map(w => `${escapeHtml(w.gha.name)} (${w.rec.overallScore}/100)`).join(' · ')}</div>
+  </div>`;
+}
+
+/* ── Re-evaluate now (Part D5) — reuses the recalc-box progress pattern
+   already used for fleet-status recalculation elsewhere in this app ── */
+async function runGhoReevaluation() {
+  const modal = openModal(`<div class="modal-head"><div><h3>Re-evaluating certifications</h3><p>Checking every active agent against current GHO rules</p></div></div><div id="ghoeval-host"></div>`);
+  const host = modal.querySelector('#ghoeval-host');
+  const ghas = getGhas().filter(g => g.status === 'ACTIVE');
+  host.innerHTML = `<div class="recalc-box">
+      <div class="recalc-head"><span class="spinner" style="border-color:rgba(37,99,235,.25);border-top-color:var(--primary)"></span>
+        <span>Evaluating agents…</span></div>
+      <div class="recalc-now mono" id="ghoeval-now">—</div>
+      <div class="recalc-track"><span class="recalc-fill" id="ghoeval-fill"></span></div>
+    </div>`;
+  for (let i = 0; i < ghas.length; i++) {
+    const nowEl = host.querySelector('#ghoeval-now'); if (nowEl) nowEl.textContent = ghas[i].name;
+    const fill = host.querySelector('#ghoeval-fill'); if (fill) fill.style.width = ((i + 1) / ghas.length * 100) + '%';
+    await new Promise(r => setTimeout(r, 180));
+  }
+
+  const summary = recomputeGhoStatuses();
+  const parts = [];
+  if (summary.issued) parts.push(`${summary.issued} certificate${summary.issued === 1 ? '' : 's'} issued`);
+  if (summary.renewed) parts.push(`${summary.renewed} renewed to good standing`);
+  if (summary.atRisk) parts.push(`${summary.atRisk} moved to at-risk`);
+  if (summary.revoked) parts.push(`${summary.revoked} revoked`);
+  if (summary.expired) parts.push(`${summary.expired} expired`);
+  const summaryText = parts.length ? parts.join(', ') : 'No status changes';
+
+  host.innerHTML = `<div class="recalc-summary">
+      <div class="rs-head"><strong>Re-evaluation complete</strong> · ${ghas.length} agent${ghas.length === 1 ? '' : 's'} checked</div>
+      <p style="font-size:13px;color:var(--text-mute);margin-top:6px">${escapeHtml(summaryText)}</p>
+    </div>
+    <div class="modal-foot"><button class="btn btn-primary" id="ghoeval-close" type="button">Done</button></div>`;
+  host.querySelector('#ghoeval-close').onclick = closeModal;
+  showToast(summaryText, parts.length ? 'success' : 'notice');
+  if (currentModule === 'gha') paintGhaManagement(document.querySelector('.module-view'));
+}
+
+function paintGhaManagement(el) {
+  const all = getGhas();
+  const perfConfig = getActiveGhaPerfConfig();
+  const warnings = ghasBelowMinimum();
+  const canConfig = hasPermission('weights');
+  if (ghaModuleTab === 'config' && !canConfig) ghaModuleTab = 'agents';
+
+  el.innerHTML = `
+    <div class="mod-wide">
+      <div class="mod-head"><div><h1 class="mod-title">GHA Management</h1>
+        <p class="mod-sub">${all.length} ground handling agent${all.length === 1 ? '' : 's'} · Multan (MUX)</p></div>
+        <div style="display:flex;gap:8px">
+          ${canConfig ? `<button class="btn btn-ghost btn-sm" id="gho-reeval" type="button">Re-evaluate now</button>` : ''}
+          <button class="btn btn-primary btn-sm" id="gha-add" type="button">+ Add GHA</button>
+        </div></div>
+
+      ${warnings.length ? ghaWarningBannerHtml(warnings) : ''}
+
+      <div class="gse-cat-tabs" id="gha-mod-tabs">
+        <button type="button" class="gct-tab ${ghaModuleTab === 'agents' ? 'active' : ''}" data-modtab="agents">Agents</button>
+        <button type="button" class="gct-tab ${ghaModuleTab === 'leaderboard' ? 'active' : ''}" data-modtab="leaderboard">Performance Leaderboard</button>
+        <button type="button" class="gct-tab ${ghaModuleTab === 'registry' ? 'active' : ''}" data-modtab="registry">GHO Registry</button>
+        ${canConfig ? `<button type="button" class="gct-tab ${ghaModuleTab === 'config' ? 'active' : ''}" data-modtab="config">Configuration</button>` : ''}
+      </div>
+
+      <div id="gha-tab-content"></div>
+    </div>`;
+
+  el.querySelector('#gha-add').onclick = () => openGhaModal(null);
+  if (canConfig) el.querySelector('#gho-reeval').onclick = () => runGhoReevaluation();
+  el.querySelector('#gha-mod-tabs').onclick = e => {
+    const b = e.target.closest('[data-modtab]'); if (!b || b.dataset.modtab === ghaModuleTab) return;
+    ghaModuleTab = b.dataset.modtab;
+    paintGhaManagement(el);
+  };
+
+  const content = el.querySelector('#gha-tab-content');
+  if (ghaModuleTab === 'leaderboard') paintGhaLeaderboard(content);
+  else if (ghaModuleTab === 'registry') paintGhoRegistry(content);
+  else if (ghaModuleTab === 'config' && canConfig) { paintGhaPerfConfig(content); paintEquipPerfConfig(content); }
+  else paintGhaAgentsTab(content, perfConfig);
+}
+
+function paintGhaAgentsTab(el, perfConfig) {
+  const all = getGhas();
+  const active = all.filter(g => g.status === 'ACTIVE');
+  const inactive = all.filter(g => g.status !== 'ACTIVE');
+  const expiringSoon = all.filter(g => ghaContractState(g).state === 'expiring').length;
+  const totalUnitsManaged = getGse().filter(u => u.status !== 'RETIRED' && u.ghaId).length;
+  const unassignedUnits = getGse().filter(u => u.status !== 'RETIRED' && !u.ghaId).length;
+
+  const q = ghaListFilter.q.trim().toLowerCase();
+  const rows = all.filter(g => {
+    if (ghaListFilter.status !== 'ALL' && g.status !== ghaListFilter.status) return false;
+    if (ghaListFilter.ownership !== 'ALL' && g.ownership !== ghaListFilter.ownership) return false;
+    if (q && !(`${g.name} ${g.code}`.toLowerCase().includes(q))) return false;
+    return true;
+  }).sort((a, b) => a.name.localeCompare(b.name));
+
+  el.innerHTML = `
+    <div class="fleet-strip">
+      <div class="fs-tile"><span class="fs-num mono" id="gha-num-active">0</span><span class="fs-lbl">Active agents</span></div>
+      <div class="fs-tile"><span class="fs-num mono" id="gha-num-units">0</span><span class="fs-lbl">Fleet units managed</span></div>
+      <div class="fs-tile ${expiringSoon ? 'warn' : ''}"><span class="fs-num mono" id="gha-num-expiring">0</span><span class="fs-lbl">Contracts expiring ≤90d</span></div>
+      <div class="fs-tile ${inactive.length ? 'warn' : ''}"><span class="fs-num mono" id="gha-num-inactive">0</span><span class="fs-lbl">Suspended / terminated</span></div>
+    </div>
+
+    <div class="filters" style="border:1px solid var(--border);border-radius:var(--r);margin-bottom:16px">
+      <div class="search"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20 L16.5 16.5"/></svg>
+        <input type="text" id="gha-search" placeholder="Search by name or code…" value="${escapeHtml(ghaListFilter.q)}" autocomplete="off"/></div>
+      <select id="gha-status-filter" class="filter-select">
+        <option value="ALL" ${ghaListFilter.status === 'ALL' ? 'selected' : ''}>All statuses</option>
+        <option value="ACTIVE" ${ghaListFilter.status === 'ACTIVE' ? 'selected' : ''}>Active</option>
+        <option value="SUSPENDED" ${ghaListFilter.status === 'SUSPENDED' ? 'selected' : ''}>Suspended</option>
+        <option value="TERMINATED" ${ghaListFilter.status === 'TERMINATED' ? 'selected' : ''}>Terminated</option>
+      </select>
+      <select id="gha-ownership-filter" class="filter-select">
+        <option value="ALL" ${ghaListFilter.ownership === 'ALL' ? 'selected' : ''}>All ownership types</option>
+        <option value="PRIVATE" ${ghaListFilter.ownership === 'PRIVATE' ? 'selected' : ''}>Private</option>
+        <option value="AIRPORT_SUBSIDIARY" ${ghaListFilter.ownership === 'AIRPORT_SUBSIDIARY' ? 'selected' : ''}>Airport Subsidiary</option>
+      </select>
+    </div>
+
+    <div class="gha-grid" id="gha-list">${rows.map((g, i) => ghaCardHtml(g, i, perfConfig)).join('')}</div>
+    ${!rows.length ? emptyState('No matching agents', 'Try a different search term or filter.') : ''}
+    ${unassignedUnits ? `<p class="an-cap mono" style="margin-top:14px">${unassignedUnits} equipment unit${unassignedUnits === 1 ? '' : 's'} currently have no assigned agent — expected for airport-owned units, no action needed.</p>` : ''}`;
+
+  countUp(document.getElementById('gha-num-active'), active.length);
+  countUp(document.getElementById('gha-num-units'), totalUnitsManaged);
+  countUp(document.getElementById('gha-num-expiring'), expiringSoon);
+  countUp(document.getElementById('gha-num-inactive'), inactive.length);
+  animatePerfRings(el);
+
+  el.querySelector('#gha-search').oninput = e => { ghaListFilter.q = e.target.value; paintGhaManagementPreserveFocus(document.querySelector('.module-view')); };
+  el.querySelector('#gha-status-filter').onchange = e => { ghaListFilter.status = e.target.value; paintGhaAgentsTab(el, perfConfig); };
+  el.querySelector('#gha-ownership-filter').onchange = e => { ghaListFilter.ownership = e.target.value; paintGhaAgentsTab(el, perfConfig); };
+  el.querySelector('#gha-list').onclick = e => {
+    const kebab = e.target.closest('[data-kebab]');
+    if (kebab) { e.stopPropagation(); openGhaMenu(kebab.dataset.kebab, kebab); return; }
+    const card = e.target.closest('[data-gha-id]'); if (card) { ghaDetailTab = 'overview'; openGhaDetail(card.dataset.ghaId); }
+  };
+}
+
+function paintGhaManagementPreserveFocus(el) {
+  const searchInput = document.getElementById('gha-search');
+  const isFocused = document.activeElement === searchInput;
+  const selStart = searchInput ? searchInput.selectionStart : 0;
+  const selEnd = searchInput ? searchInput.selectionEnd : 0;
+  paintGhaAgentsTab(document.getElementById('gha-tab-content'), getActiveGhaPerfConfig());
+  if (isFocused) {
+    const newInp = document.getElementById('gha-search');
+    if (newInp) { newInp.focus(); try { newInp.setSelectionRange(selStart, selEnd); } catch (e) { } }
+  }
+}
+
+/* ── performance leaderboard (Part D3) ── */
+let ghaLeaderboardPeriod = currentPeriod();
+let ghaLeaderboardSort = 'score-desc';
+function paintGhaLeaderboard(el) {
+  const config = getActiveGhaPerfConfig();
+  const threshold = config.params.minimumThreshold;
+  const periods = last6Periods();
+  const ghas = getGhas().filter(g => g.status === 'ACTIVE');
+  const rows = ghas.map(g => ({ gha: g, rec: getGhaPerfRecord(g.id, ghaLeaderboardPeriod) })).filter(r => r.rec);
+
+  const sorters = {
+    'score-desc': (a, b) => b.rec.overallScore - a.rec.overallScore,
+    'score-asc': (a, b) => a.rec.overallScore - b.rec.overallScore,
+    name: (a, b) => a.gha.name.localeCompare(b.gha.name)
+  };
+  rows.sort(sorters[ghaLeaderboardSort] || sorters['score-desc']);
+
+  el.innerHTML = `
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:14px">
+        <h3 class="card-h" style="margin:0">Performance leaderboard</h3>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="lb-period" class="filter-select">
+            ${periods.map(p => `<option value="${p}" ${p === ghaLeaderboardPeriod ? 'selected' : ''}>${escapeHtml(periodLabel(p))}</option>`).join('')}
+          </select>
+          <select id="lb-sort" class="filter-select">
+            <option value="score-desc" ${ghaLeaderboardSort === 'score-desc' ? 'selected' : ''}>Score · high to low</option>
+            <option value="score-asc" ${ghaLeaderboardSort === 'score-asc' ? 'selected' : ''}>Score · low to high</option>
+            <option value="name" ${ghaLeaderboardSort === 'name' ? 'selected' : ''}>Name</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-scroll"><table class="eq-tbl">
+        <thead><tr><th>#</th><th>Agent</th><th>Score</th><th>Deployment</th><th>Serviceability</th><th>Suitability</th><th>Fuel Eff.</th><th>Status</th></tr></thead>
+        <tbody id="lb-body">
+          ${rows.length ? rows.map((r, i) => {
+    const tier = ghaScoreTier(r.rec.overallScore, threshold);
+    const color = tier === 'green' ? 'var(--green)' : tier === 'amber' ? 'var(--amber)' : 'var(--red)';
+    return `<tr data-gha-id="${r.gha.id}" class="card-stagger" style="animation-delay:${i * 40}ms">
+              <td class="mono">${i + 1}</td>
+              <td>${escapeHtml(r.gha.name)}</td>
+              <td class="mono" style="font-weight:700;color:${color}">${r.rec.overallScore}</td>
+              <td class="mono">${r.rec.metrics.deployment}%</td>
+              <td class="mono">${r.rec.metrics.serviceability}%</td>
+              <td class="mono">${r.rec.metrics.suitability}%</td>
+              <td class="mono">${r.rec.metrics.fuelEfficiency}%</td>
+              <td>${r.rec.belowMinimum ? '<span class="eq-status es-bad">BELOW MIN</span>' : '<span class="eq-status es-ok">OK</span>'}</td>
+            </tr>`;
+  }).join('') : `<tr><td colspan="8">${emptyState('No data for this period', 'Try a different month.')}</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>`;
+
+  el.querySelector('#lb-period').onchange = e => { ghaLeaderboardPeriod = e.target.value; paintGhaLeaderboard(el); };
+  el.querySelector('#lb-sort').onchange = e => { ghaLeaderboardSort = e.target.value; paintGhaLeaderboard(el); };
+  el.querySelector('#lb-body').onclick = e => {
+    const row = e.target.closest('[data-gha-id]'); if (!row) return;
+    ghaDetailTab = 'performance';
+    openGhaDetail(row.dataset.ghaId);
+  };
+}
+
+/* ── GHO registry (Part D3) — the kind of screen shown to an auditor,
+   so it gets a more formal visual treatment than the operational tabs ── */
+function paintGhoRegistry(el) {
+  /* same ACTIVE-only scope as the Manager Dashboard's certification tile,
+     so the two counts can never diverge (a suspended/terminated GHA
+     shouldn't appear "certified" in the register even if an old certificate
+     is technically still on file) */
+  const withCert = getGhas().filter(g => g.status === 'ACTIVE').map(g => ({ gha: g, cert: currentGhoCertificate(g.id) }));
+  const issued = withCert.filter(x => x.cert && x.cert.status === 'ISSUED').sort((a, b) => b.cert.trailingAverageScore - a.cert.trailingAverageScore);
+  const atRisk = withCert.filter(x => x.cert && x.cert.status === 'AT_RISK').sort((a, b) => b.cert.trailingAverageScore - a.cert.trailingAverageScore);
+
+  el.innerHTML = `
+    <div class="gho-registry">
+      <div class="gho-registry-head">
+        <div class="gho-registry-seal">${ghoSealSVG(48)}</div>
+        <div>
+          <h2>Certified Ground Handling Agents</h2>
+          <p class="mono">Official register · Multan International Airport (MUX) · ${issued.length} certified agent${issued.length === 1 ? '' : 's'}</p>
+        </div>
+      </div>
+
+      <div class="table-scroll"><table class="eq-tbl gho-registry-tbl">
+        <thead><tr><th>Agent</th><th>Certificate No.</th><th>Issued</th><th>Expires</th><th>Trailing Score</th><th></th></tr></thead>
+        <tbody>
+          ${issued.length ? issued.map(({ gha, cert }) => `
+            <tr data-cert-id="${cert.id}">
+              <td>${escapeHtml(gha.name)}</td>
+              <td class="mono">${escapeHtml(cert.certificateNumber)}</td>
+              <td class="mono">${fmtDate(cert.issuedAt)}</td>
+              <td class="mono">${fmtDate(cert.expiresAt)}</td>
+              <td class="mono" style="font-weight:700;color:var(--green)">${cert.trailingAverageScore}%</td>
+              <td><button class="btn btn-ghost btn-xs" data-view-cert="${cert.id}" type="button">View</button></td>
+            </tr>`).join('') : `<tr><td colspan="6">${emptyState('No certified agents yet', 'Run Re-evaluate now once enough performance history exists.')}</td></tr>`}
+        </tbody>
+      </table></div>
+
+      ${atRisk.length ? `
+      <div class="gho-atrisk-section">
+        <h3 class="card-h" style="color:#92400E">⚠ At-risk certificates (${atRisk.length})</h3>
+        <div class="table-scroll"><table class="eq-tbl">
+          <thead><tr><th>Agent</th><th>Certificate No.</th><th>Expires</th><th>Trailing Score</th><th></th></tr></thead>
+          <tbody>
+            ${atRisk.map(({ gha, cert }) => `
+              <tr data-cert-id="${cert.id}">
+                <td>${escapeHtml(gha.name)}</td>
+                <td class="mono">${escapeHtml(cert.certificateNumber)}</td>
+                <td class="mono">${fmtDate(cert.expiresAt)}</td>
+                <td class="mono" style="font-weight:700;color:var(--amber)">${cert.trailingAverageScore}%</td>
+                <td><button class="btn btn-ghost btn-xs" data-view-cert="${cert.id}" type="button">View</button></td>
+              </tr>`).join('')}
+          </tbody>
+        </table></div>
+      </div>` : ''}
+    </div>`;
+
+  el.querySelectorAll('[data-view-cert]').forEach(b => b.onclick = e => { e.stopPropagation(); openCertificateView(b.dataset.viewCert); });
+  el.querySelectorAll('tr[data-cert-id]').forEach(row => row.onclick = () => openCertificateView(row.dataset.certId));
+}
+
+/* ── performance config (Part F) — append-only, identical UX to Weights & Thresholds ── */
+function saveNewGhaPerfConfigVersion(params, note) {
+  const versions = getGhaPerfConfigVersions();
+  versions.forEach(v => { if (v.status === 'ACTIVE') v.status = 'SUPERSEDED'; });
+  const nv = {
+    id: 'gpc-' + uid('v').slice(-6), createdAt: nowISO(), author: currentActor(),
+    note: note || 'Manual calibration update.', status: 'ACTIVE', params: JSON.parse(JSON.stringify(params))
+  };
+  versions.push(nv); saveGhaPerfConfigVersions(versions);
+  logActivity({ action: 'created GHA performance config version', target: nv.id, category: 'gha-performance', severity: 'warn' });
+  return nv;
+}
+
+function saveNewEquipPerfConfigVersion(params, note) {
+  const versions = getEquipPerfConfigVersions();
+  versions.forEach(v => { if (v.status === 'ACTIVE') v.status = 'SUPERSEDED'; });
+  const nv = {
+    id: 'epc-' + uid('v').slice(-6), createdAt: nowISO(), author: currentActor(),
+    note: note || 'Manual equipment decay configuration update.', status: 'ACTIVE',
+    params: JSON.parse(JSON.stringify(params))
+  };
+  versions.push(nv); saveEquipPerfConfigVersions(versions);
+  logActivity({ action: 'created equipment performance config version', target: nv.id, category: 'equipment', severity: 'warn' });
+  return nv;
+}
+function paintGhaPerfConfig(el) {
+  const active = getActiveGhaPerfConfig();
+  const proposed = JSON.parse(JSON.stringify(active.params));
+  const metricKeys = ['deployment', 'serviceability', 'suitability', 'fuelEfficiency'];
+
+  el.innerHTML = `
+    <div class="card">
+      <h3 class="card-h">Scoring weights <span class="wt-total mono" id="gpc-total">1.000</span></h3>
+      <div id="gpc-sliders">
+        ${metricKeys.map(k => `
+          <div class="wt-row"><label>${ghaMetricLabel(k)}</label>
+            <input type="range" min="0" max="1" step="0.01" value="${proposed.metricWeights[k]}" data-w="${k}"/>
+            <span class="wt-val mono" data-wv="${k}">${proposed.metricWeights[k].toFixed(2)}</span></div>`).join('')}
+      </div>
+      <div class="wt-validate" id="gpc-validate"></div>
+      <div class="wt-btns"><button class="btn btn-ghost btn-sm" id="gpc-normalise" type="button">Normalise to 1.0</button></div>
+
+      <h3 class="card-h" style="margin-top:20px">Minimum performance threshold</h3>
+      <div class="field" style="max-width:200px">
+        <div class="input-wrap"><input type="number" id="gpc-threshold" min="0" max="100" value="${proposed.minimumThreshold}"/><span class="input-unit mono">/ 100</span></div>
+      </div>
+
+      <h3 class="card-h" style="margin-top:20px">GHO certification rules</h3>
+      <div class="grid-2">
+        <div class="field"><label for="gpc-gho-threshold">Annual (trailing 12mo) threshold</label>
+          <div class="input-wrap"><input type="number" id="gpc-gho-threshold" min="0" max="100" value="${proposed.ghoAnnualThreshold}"/><span class="input-unit mono">/ 100</span></div>
+        </div>
+        <div class="field"><label for="gpc-gho-maxbelow">Max months below minimum</label>
+          <div class="input-wrap"><input type="number" id="gpc-gho-maxbelow" min="0" max="12" value="${proposed.ghoMaxMonthsBelow}"/><span class="input-unit mono">months</span></div>
+        </div>
+      </div>
+      <div class="field" style="max-width:200px">
+        <label for="gpc-gho-validity">Certificate validity</label>
+        <div class="input-wrap"><input type="number" id="gpc-gho-validity" min="1" max="60" value="${proposed.ghoValidityMonths}"/><span class="input-unit mono">months</span></div>
+      </div>
+
+      <div class="wt-actions">
+        <button class="btn btn-primary btn-sm" id="gpc-save" type="button">Save new version &amp; recompute</button>
+      </div>
+    </div>
+
+    <div class="card"><h3 class="card-h">Version history</h3>
+      <div class="table-scroll"><table class="ver-tbl">
+        <thead><tr><th>Version</th><th>Status</th><th>Author</th><th>Created</th><th>Note</th></tr></thead>
+        <tbody>${getGhaPerfConfigVersions().slice().reverse().map(v => `
+          <tr><td class="mono">${escapeHtml(v.id)}</td><td><span class="ver-status vs-${v.status.toLowerCase()}">${v.status}</span></td>
+            <td>${escapeHtml(v.author)}</td><td class="mono">${fmtDate(v.createdAt)}</td><td class="ver-note">${escapeHtml(v.note)}</td></tr>`).join('')}
+        </tbody></table></div>
+    </div>`;
+
+  function readTotal() { return metricKeys.reduce((a, k) => a + proposed.metricWeights[k], 0); }
+  function paintTotal() {
+    const total = readTotal();
+    const t = el.querySelector('#gpc-total'); t.textContent = total.toFixed(3);
+    const ok = Math.abs(total - 1) < 0.001;
+    t.classList.toggle('bad', !ok); t.classList.toggle('good', ok);
+    const val = el.querySelector('#gpc-validate');
+    val.className = 'wt-validate ' + (ok ? 'ok' : 'bad');
+    val.textContent = ok ? '✓ Weights sum to 1.0 — save enabled.' : `VALIDATION_FAILED · weights sum to ${total.toFixed(3)}, must equal 1.0`;
+    el.querySelector('#gpc-save').disabled = !ok;
+  }
+  paintTotal();
+
+  el.querySelector('#gpc-sliders').oninput = e => {
+    const s = e.target.closest('[data-w]'); if (!s) return;
+    const k = s.dataset.w; proposed.metricWeights[k] = Number(s.value);
+    el.querySelector(`[data-wv="${k}"]`).textContent = proposed.metricWeights[k].toFixed(2);
+    paintTotal();
+  };
+  el.querySelector('#gpc-normalise').onclick = () => {
+    const s = readTotal() || 1;
+    metricKeys.forEach(k => proposed.metricWeights[k] = +(proposed.metricWeights[k] / s).toFixed(3));
+    metricKeys.forEach(k => {
+      const sl = el.querySelector(`[data-w="${k}"]`); sl.value = proposed.metricWeights[k];
+      el.querySelector(`[data-wv="${k}"]`).textContent = proposed.metricWeights[k].toFixed(2);
+    });
+    paintTotal();
+  };
+  el.querySelector('#gpc-threshold').oninput = e => { proposed.minimumThreshold = Number(e.target.value) || 0; };
+  el.querySelector('#gpc-gho-threshold').oninput = e => { proposed.ghoAnnualThreshold = Number(e.target.value) || 0; };
+  el.querySelector('#gpc-gho-maxbelow').oninput = e => { proposed.ghoMaxMonthsBelow = Number(e.target.value) || 0; };
+  el.querySelector('#gpc-gho-validity').oninput = e => { proposed.ghoValidityMonths = Number(e.target.value) || 1; };
+
+  el.querySelector('#gpc-save').onclick = () => {
+    const total = readTotal();
+    if (Math.abs(total - 1) >= 0.001) { showToast('VALIDATION_FAILED — weights must sum to 1.0', 'error'); return; }
+    saveNewGhaPerfConfigVersion(proposed, 'Manual calibration update.');
+    recomputeAllGhaPerformance();
+    showToast('New performance config saved — scores recomputed', 'success');
+    paintGhaManagement(document.querySelector('.module-view'));
+  };
+}
+
+function paintEquipPerfConfig(el) {
+  const active = getActiveEquipPerfConfig();
+  const proposed = JSON.parse(JSON.stringify(active.params));
+  const cats = ['POWERED', 'NON_POWERED', 'INFRASTRUCTURE'];
+  const catLabels = { POWERED: 'Powered GSE', NON_POWERED: 'Non-Powered', INFRASTRUCTURE: 'Infrastructure' };
+
+  el.innerHTML += `
+    <div class="card" style="margin-top:20px">
+      <h3 class="card-h">Equipment Performance Decay Configuration
+        <span class="mono" style="font-size:11px;color:var(--text-mute);margin-left:8px">v${escapeHtml(active.id || 'default')}</span></h3>
+      <p style="font-size:12px;color:var(--text-mute);margin-bottom:14px">Age-based performance scoring — per-category yearly decline, floor percentages, and adjustment bonuses.</p>
+
+      <h3 class="card-h" style="margin-bottom:8px">Per-Category Decay Curves</h3>
+      <div class="epc-cat-grid">
+        ${cats.map(cat => {
+          const c = proposed.perCategoryCurves[cat];
+          return `<div class="epc-cat-card">
+            <div class="epc-cat-title">${catLabels[cat]}</div>
+            <div class="field" style="margin-bottom:8px"><label>Yearly decline %</label>
+              <div class="input-wrap"><input type="number" min="0" max="30" step="0.5" value="${c.yearlyDeclinePercent}" data-epc-cat="${cat}" data-epc-field="yearlyDeclinePercent"/><span class="input-unit mono">%/yr</span></div></div>
+            <div class="field"><label>Floor %</label>
+              <div class="input-wrap"><input type="number" min="0" max="100" step="1" value="${c.floorPercent}" data-epc-cat="${cat}" data-epc-field="floorPercent"/><span class="input-unit mono">%</span></div></div>
+          </div>`;
+        }).join('')}
+      </div>
+
+      <h3 class="card-h" style="margin:16px 0 8px">Global Adjustments</h3>
+      <div class="epc-global-grid">
+        <div class="field"><label>Maintenance bonus (90-day window)</label>
+          <div class="input-wrap"><input type="number" min="0" max="20" step="1" value="${proposed.maintenanceBonusPercent}" id="epc-maint-bonus"/><span class="input-unit mono">%</span></div></div>
+        <div class="field"><label>Reactivation penalty</label>
+          <div class="input-wrap"><input type="number" min="0" max="30" step="1" value="${proposed.reactivationPenaltyPercent}" id="epc-react-penalty"/><span class="input-unit mono">%</span></div></div>
+      </div>
+
+      <div class="wt-actions">
+        <button class="btn btn-ghost btn-sm" id="epc-recompute" type="button">Recompute scores now</button>
+        <button class="btn btn-primary btn-sm" id="epc-save" type="button">Save new version & recompute</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h3 class="card-h">Equipment Performance Config History</h3>
+      <div class="table-scroll"><table class="ver-tbl">
+        <thead><tr><th>Version</th><th>Status</th><th>Author</th><th>Created</th><th>Note</th></tr></thead>
+        <tbody>${getEquipPerfConfigVersions().slice().reverse().map(v => `
+          <tr><td class="mono">${escapeHtml(v.id)}</td><td><span class="ver-status vs-${v.status.toLowerCase()}">${v.status}</span></td>
+            <td>${escapeHtml(v.author)}</td><td class="mono">${fmtDate(v.createdAt)}</td><td class="ver-note">${escapeHtml(v.note)}</td></tr>`).join('')}
+        </tbody></table></div>
+    </div>`;
+
+  // Wire category field inputs
+  el.querySelectorAll('[data-epc-cat]').forEach(inp => {
+    inp.oninput = () => {
+      const cat = inp.dataset.epcCat, field = inp.dataset.epcField;
+      proposed.perCategoryCurves[cat][field] = Number(inp.value) || 0;
+    };
+  });
+  // Wire global fields
+  const mb = el.querySelector('#epc-maint-bonus');
+  if (mb) mb.oninput = () => { proposed.maintenanceBonusPercent = Number(mb.value) || 0; };
+  const rp = el.querySelector('#epc-react-penalty');
+  if (rp) rp.oninput = () => { proposed.reactivationPenaltyPercent = Number(rp.value) || 0; };
+
+  // Recompute button (no config change)
+  el.querySelector('#epc-recompute').onclick = () => {
+    const before = avgFleetPerfScore();
+    recomputeAllEquipmentScores();
+    const after = avgFleetPerfScore();
+    showToast(`Scores recomputed — fleet average ${before}% → ${after}%`, 'success');
+    if (currentModule === 'gha') paintGhaManagement(document.querySelector('.module-view'));
+  };
+
+  // Save new version
+  el.querySelector('#epc-save').onclick = () => {
+    const before = avgFleetPerfScore();
+    saveNewEquipPerfConfigVersion(proposed, 'Manual equipment decay configuration update.');
+    recomputeAllEquipmentScores();
+    recomputeAllGhaPerformance();
+    const after = avgFleetPerfScore();
+    showToast(`Average fleet score changed from ${before}% to ${after}%`, 'success');
+    paintGhaManagement(document.querySelector('.module-view'));
+  };
+}
+
+/* ── add / edit GHA modal ── */
+function openGhaModal(id) {
+  const g = id ? getGha(id) : null;
+  const modal = openModal(`
+    <div class="modal-head"><div><h3>${g ? 'Edit GHA' : 'Add GHA'}</h3><p>${g ? escapeHtml(g.name) : 'Register a new ground handling agent'}</p></div>
+      <button class="modal-x" data-x aria-label="Close"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6 L18 18 M18 6 L6 18"/></svg></button></div>
+    <div class="field" data-field="gha-name"><label for="gha-f-name">Agent name</label><div class="input-wrap"><input type="text" id="gha-f-name" value="${g ? escapeHtml(g.name) : ''}" placeholder="e.g. Menzies-RAS" autocomplete="off"/></div><p class="field-err"></p></div>
+    <div class="grid-2">
+      <div class="field" data-field="gha-code"><label for="gha-f-code">Short code</label><div class="input-wrap"><input type="text" id="gha-f-code" value="${g ? escapeHtml(g.code) : ''}" placeholder="e.g. MNZ" autocomplete="off"/></div><p class="field-err"></p></div>
+      <div class="field"><label for="gha-f-ownership">Ownership</label><div class="input-wrap"><select id="gha-f-ownership">
+        <option value="PRIVATE" ${!g || g.ownership === 'PRIVATE' ? 'selected' : ''}>Private</option>
+        <option value="AIRPORT_SUBSIDIARY" ${g && g.ownership === 'AIRPORT_SUBSIDIARY' ? 'selected' : ''}>Airport Subsidiary</option>
+      </select></div></div>
+    </div>
+    <div class="field" data-field="gha-license"><label for="gha-f-license">Licence number</label><div class="input-wrap"><input type="text" id="gha-f-license" value="${g ? escapeHtml(g.licenseNumber) : ''}" placeholder="e.g. PCAA/GH/MUX/000" autocomplete="off"/></div><p class="field-err"></p></div>
+    <div class="grid-2">
+      <div class="field" data-field="gha-start"><label for="gha-f-start">Contract start</label><div class="input-wrap date-wrap">
+        <svg class="date-ico" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+        <input type="date" id="gha-f-start" value="${g ? g.contractStart.slice(0, 10) : nowISO().slice(0, 10)}"/></div><p class="field-err"></p></div>
+      <div class="field" data-field="gha-end"><label for="gha-f-end">Contract end</label><div class="input-wrap date-wrap">
+        <svg class="date-ico" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+        <input type="date" id="gha-f-end" value="${g ? g.contractEnd.slice(0, 10) : addMinutesISO(nowISO(), 60 * 24 * 365).slice(0, 10)}"/></div><p class="field-err"></p></div>
+    </div>
+    <div class="grid-2">
+      <div class="field"><label for="gha-f-contact-name">Contact name</label><div class="input-wrap"><input type="text" id="gha-f-contact-name" value="${g ? escapeHtml(g.contactName || '') : ''}" placeholder="Jane Doe" autocomplete="off"/></div></div>
+      <div class="field"><label for="gha-f-contact-phone">Contact phone</label><div class="input-wrap"><input type="text" id="gha-f-contact-phone" value="${g ? escapeHtml(g.contactPhone || '') : ''}" placeholder="+92-…" autocomplete="off"/></div></div>
+    </div>
+    <div class="field" data-field="gha-contact"><label for="gha-f-contact-email">Contact email</label><div class="input-wrap"><input type="text" id="gha-f-contact-email" value="${g ? escapeHtml(g.contactEmail || '') : ''}" placeholder="ops@agent.com" autocomplete="off"/></div><p class="field-err"></p></div>
+    <div class="field"><label for="gha-f-airline-input">Airlines served</label>
+      <div class="input-wrap"><input type="text" id="gha-f-airline-input" placeholder="Type a code, press Enter (e.g. QR)" autocomplete="off"/></div>
+      <div class="eq-type-chips" id="gha-f-airline-chips"></div>
+    </div>
+    <div class="modal-foot"><button class="btn btn-ghost" data-x>Cancel</button><button class="btn btn-primary" id="gha-save">${g ? 'Save changes' : 'Create GHA'}</button></div>`, true);
+
+  modal.querySelectorAll('[data-x]').forEach(b => b.onclick = closeModal);
+
+  let airlines = new Set((g && g.airlinesServed) || []);
+  const chipsEl = modal.querySelector('#gha-f-airline-chips');
+  function paintChips() { chipsEl.innerHTML = [...airlines].map(a => `<button type="button" class="eq-chip active" data-air="${escapeHtml(a)}">${escapeHtml(a)} ×</button>`).join(''); }
+  paintChips();
+  chipsEl.onclick = e => { const chip = e.target.closest('[data-air]'); if (!chip) return; airlines.delete(chip.dataset.air); paintChips(); };
+  const airlineInput = modal.querySelector('#gha-f-airline-input');
+  airlineInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      const v = airlineInput.value.trim().toUpperCase().replace(/,$/, '');
+      if (v) { airlines.add(v); paintChips(); }
+      airlineInput.value = '';
+    }
+  });
+
+  modal.querySelector('#gha-save').onclick = () => {
+    const name = modal.querySelector('#gha-f-name').value.trim();
+    const code = modal.querySelector('#gha-f-code').value.trim().toUpperCase();
+    const ownership = modal.querySelector('#gha-f-ownership').value;
+    const license = modal.querySelector('#gha-f-license').value.trim();
+    const startVal = modal.querySelector('#gha-f-start').value;
+    const endVal = modal.querySelector('#gha-f-end').value;
+    const contactName = modal.querySelector('#gha-f-contact-name').value.trim();
+    const contactPhone = modal.querySelector('#gha-f-contact-phone').value.trim();
+    const contactEmail = modal.querySelector('#gha-f-contact-email').value.trim();
+
+    modal.querySelectorAll('.field').forEach(f => f.classList.remove('bad'));
+    let bad = false;
+    const fail = (sel, msg) => { const f = modal.querySelector(sel); f.classList.add('bad'); const err = f.querySelector('.field-err'); if (err) err.textContent = msg; bad = true; };
+
+    if (name.length < 2) fail('[data-field="gha-name"]', "Enter the agent's full name.");
+    if (!code) fail('[data-field="gha-code"]', 'Enter a short code.');
+    else { const dup = getGhas().find(x => x.code.toLowerCase() === code.toLowerCase() && x.id !== id); if (dup) fail('[data-field="gha-code"]', 'That code is already in use.'); }
+    if (!license) fail('[data-field="gha-license"]', 'Licence number is required.');
+    if (!startVal) fail('[data-field="gha-start"]', 'Contract start date is required.');
+    if (!endVal) fail('[data-field="gha-end"]', 'Contract end date is required.');
+    else if (startVal && new Date(endVal) <= new Date(startVal)) fail('[data-field="gha-end"]', 'Contract end must be after the start date.');
+    if (!contactName && !contactPhone && !contactEmail) fail('[data-field="gha-contact"]', 'Provide at least one contact field (name, phone or email).');
+    if (bad) return;
+
+    const list = getGhas();
+    const nowIso = nowISO();
+    let savedId = id;
+    if (g) {
+      Object.assign(list.find(x => x.id === id), {
+        name, code, ownership, licenseNumber: license,
+        contractStart: new Date(startVal).toISOString(), contractEnd: new Date(endVal).toISOString(),
+        contactName, contactPhone, contactEmail, airlinesServed: [...airlines], updatedAt: nowIso
+      });
+      saveGhas(list);
+      logActivity({ action: 'edited GHA', target: name, category: 'gha', severity: 'info' });
+      showToast(`${name} updated`, 'success');
+    } else {
+      const newG = {
+        id: uid('gha'), name, code, ownership, licenseNumber: license,
+        contactName, contactPhone, contactEmail,
+        contractStart: new Date(startVal).toISOString(), contractEnd: new Date(endVal).toISOString(),
+        airlinesServed: [...airlines], status: 'ACTIVE', createdAt: nowIso, updatedAt: nowIso
+      };
+      list.push(newG); saveGhas(list); savedId = newG.id;
+      logActivity({ action: 'created GHA', target: name, category: 'gha', severity: 'success' });
+      showToast(`${name} created`, 'success');
+    }
+    closeModal();
+    if (currentModule === 'gha') paintGhaManagement(document.querySelector('.module-view'));
+    if (currentModule === 'equipment') renderEquipmentBody();
+    if (ghaDetailOpenId === savedId) openGhaDetail(savedId);
+  };
+}
+
+/* ── status changes (suspend / reactivate / terminate) ── */
+function updateGha(id, changes) {
+  const list = getGhas(); const g = list.find(x => x.id === id);
+  if (!g) return null; Object.assign(g, changes, { updatedAt: nowISO() }); saveGhas(list); return g;
+}
+
+function openGhaMenu(id, anchor) {
+  const g = getGha(id); if (!g) return;
+  const items = [
+    { key: 'view', label: 'View details', onClick: () => openGhaDetail(id) },
+    { key: 'edit', label: 'Edit GHA', onClick: () => openGhaModal(id) },
+    { sep: true }
+  ];
+  if (g.status !== 'ACTIVE') items.push({ key: 'reactivate', label: 'Reactivate', onClick: () => ghaStatusChange(id, 'ACTIVE') });
+  if (g.status !== 'SUSPENDED') items.push({ key: 'suspend', label: 'Suspend', onClick: () => ghaStatusChange(id, 'SUSPENDED') });
+  if (g.status !== 'TERMINATED') items.push({ key: 'terminate', label: 'Terminate', danger: true, onClick: () => ghaStatusChange(id, 'TERMINATED') });
+  openKebab(anchor, items);
+}
+
+async function ghaStatusChange(id, newStatus) {
+  const g = getGha(id); if (!g) return;
+  const copy = {
+    SUSPENDED: { title: 'Suspend GHA', verb: 'Suspend', past: 'suspended', danger: true, note: "Its assigned equipment stays assigned unless reassigned separately." },
+    TERMINATED: { title: 'Terminate GHA', verb: 'Terminate', past: 'terminated', danger: true, note: "Its assigned equipment stays assigned unless reassigned separately — use this agent's detail view to move it." },
+    ACTIVE: { title: 'Reactivate GHA', verb: 'Reactivate', past: 'reactivated', danger: false, note: '' }
+  }[newStatus];
+  const ok = await confirmDialog({ title: copy.title, danger: copy.danger, confirmLabel: copy.verb, message: `${copy.verb} ${g.name}? ${copy.note}` });
+  if (!ok) return;
+  updateGha(id, { status: newStatus });
+  logActivity({ action: `${copy.past} GHA`, target: g.name, category: 'gha', severity: copy.danger ? 'warn' : 'success' });
+  showToast(`${g.name} ${copy.past}`, copy.danger ? 'notice' : 'success');
+  if (currentModule === 'gha') paintGhaManagement(document.querySelector('.module-view'));
+  if (ghaDetailOpenId === id) openGhaDetail(id);
+}
+
+/* ── GHA detail (overview · assigned equipment · reassign · contract) —
+   a centred modal, not a side drawer; ghaDetailOpenId tracks which GHA (if
+   any) currently has its detail modal open, so edit/status-change actions
+   know whether to refresh it in place afterward. ── */
+let ghaDetailTab = 'overview';
+let ghaDetailOpenId = null;
+
+function ghaOverviewTabHtml(g) {
+  const { total } = ghaFleetBreakdown(g.id);
+  const contract = ghaContractState(g);
+  const perfConfig = getActiveGhaPerfConfig();
+  const perfRec = getGhaPerfRecord(g.id, currentPeriod());
+  const airlines = g.airlinesServed && g.airlinesServed.length ? g.airlinesServed : [];
+
+  return `<div class="dw-section" style="margin-top:0">
+      <div class="dw-snapshot">
+        <div class="dw-snap-tile center">
+          ${perfRec ? perfRingHtml(perfRec.overallScore, perfConfig.params.minimumThreshold, 44, 13) : `<span class="dw-snap-val" style="color:var(--text-mute)">—</span>`}
+          <span class="dw-snap-lbl">Performance</span>
+        </div>
+        <div class="dw-snap-tile center">
+          <span class="dw-snap-val">${total}</span>
+          <span class="dw-snap-lbl">Equipment units</span>
+        </div>
+        <div class="dw-snap-tile center">
+          <span class="dw-snap-val" style="font-size:14px">${ghaContractFlagHtml(g)}</span>
+          <span class="dw-snap-lbl">Contract${contract.state === 'ok' ? '' : ' — ' + (contract.state === 'expired' ? 'expired' : 'expiring soon')}</span>
+        </div>
+        <div class="dw-snap-tile center">
+          ${ghoBadgeHtml(g.id)}
+          <span class="dw-snap-lbl">GHO certification</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="dw-section"><h4>Contact</h4>
+      <div class="dw-grid">
+        <div class="dw-item"><div class="k">Name</div><div class="v">${escapeHtml(g.contactName || '—')}</div></div>
+        <div class="dw-item"><div class="k">Phone</div><div class="v mono">${escapeHtml(g.contactPhone || '—')}</div></div>
+        <div class="dw-item" style="grid-column:1 / -1"><div class="k">Email</div><div class="v mono">${escapeHtml(g.contactEmail || '—')}</div></div>
+      </div>
+    </div>
+
+    <div class="dw-section"><h4>Airlines served</h4>
+      ${airlines.length ? `<div class="dw-perms">${airlines.map(a => `<span class="dw-perm">${escapeHtml(a)}</span>`).join('')}</div>` : `<p class="rs-none">No scheduled airlines.</p>`}
+    </div>
+
+    <button class="btn btn-ghost btn-sm" id="gha-dw-edit" type="button" style="margin-top:20px;width:100%">Edit GHA</button>`;
+}
+function ghaEquipmentTabHtml(g, units, cats, total, otherGhas, color) {
+  return `<div class="dw-section" style="margin-top:0"><h4>Assigned equipment (${total})</h4>
+      ${total ? `
+      <div class="gr-cats" style="margin-bottom:12px">
+        ${[['POWERED', '⚡ Powered'], ['NON_POWERED', '📦 Non-powered'], ['INFRASTRUCTURE', '🏗 Infrastructure']].filter(([k]) => cats[k]).map(([k, label]) => {
+      const pct = total ? Math.round(cats[k] / total * 100) : 0;
+      return `<div class="grc-row"><span class="grc-lbl">${label}</span><span class="grc-bar"><span style="width:${pct}%;background:${color}"></span></span><span class="mono grc-val">${cats[k]}</span></div>`;
+    }).join('')}
+      </div>
+      <div class="bulkbar" id="gha-reassign-bar" hidden>
+        <span class="bulk-count mono"><strong id="gha-reassign-n">0</strong> selected</span>
+        <div class="bulk-actions" style="align-items:center;gap:8px">
+          <select id="gha-reassign-target" class="filter-select" style="min-width:150px">
+            <option value="">— Unassigned —</option>
+            ${otherGhas.map(og => `<option value="${og.id}">${escapeHtml(og.name)}</option>`).join('')}
+          </select>
+          <button class="btn btn-primary btn-xs" id="gha-reassign-go" type="button">Reassign</button>
+          <button class="btn btn-ghost btn-xs" id="gha-reassign-clear" type="button">Clear</button>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="eq-tbl">
+          <thead><tr><th class="th-check"><input type="checkbox" id="gha-check-all" aria-label="Select all"/></th><th>Type</th><th>Ownership</th><th>Serial</th><th>Status</th><th>Last service</th></tr></thead>
+          <tbody id="gha-unit-body">
+            ${units.map(u => {
+      const stCls = { SERVICEABLE: 'ok', UNSERVICEABLE: 'bad', MAINTENANCE: 'maint', RETIRED: 'ret' }[u.status];
+      return `<tr data-unit="${u.id}">
+                <td class="cell-check"><input type="checkbox" data-check="${u.id}" aria-label="Select ${escapeHtml(u.serial)}"/></td>
+                <td>${escapeHtml(u.type)}</td><td>${ownBadge(u.ownership)}</td><td class="mono">${escapeHtml(u.serial)}</td>
+                <td><span class="eq-status es-${stCls}">${u.status}</span></td>
+                <td class="mono">${fmtDate(u.lastService)}</td>
+              </tr>`;
+    }).join('')}
+          </tbody>
+        </table>
+      </div>` : `<p class="rs-none">No equipment currently assigned to this agent.</p>`}
+    </div>`;
+}
+function ghaContractTabHtml(g, contract) {
+  return `<div class="dw-section" style="margin-top:0">
+      <div class="dw-grid">
+        <div class="dw-item"><div class="k">Start</div><div class="v mono">${fmtDate(g.contractStart)}</div></div>
+        <div class="dw-item"><div class="k">End</div><div class="v mono">${fmtDate(g.contractEnd)}</div></div>
+      </div>
+      <div class="form-msg ${contract.state === 'expired' ? 'error' : contract.state === 'expiring' ? 'notice' : 'info'}" style="margin-top:12px">
+        ${contract.state === 'expired' ? `⚠ Contract expired ${Math.abs(contract.daysLeft)} day${Math.abs(contract.daysLeft) === 1 ? '' : 's'} ago — renewal required.`
+      : contract.state === 'expiring' ? `⚠ Contract expires in ${contract.daysLeft} day${contract.daysLeft === 1 ? '' : 's'} — within the 90-day renewal window.`
+        : `✓ Contract in good standing — ${contract.daysLeft} days remaining.`}
+      </div>
+    </div>`;
+}
+function ghaTrendChartSVG(records, threshold) {
+  if (records.length < 2) return '<p class="rs-none">Not enough history.</p>';
+  const W = 300, H = 170, padL = 26, padB = 22, padT = 10, padR = 8;
+  const x = i => padL + (i / (records.length - 1)) * (W - padL - padR);
+  const y = v => padT + (1 - v / 100) * (H - padT - padB);
+  const pts = records.map((r, i) => [x(i), y(r.overallScore)]);
+  const thresholdY = y(threshold);
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%">
+    ${[0, 50, 100].map(v => `<line x1="${padL}" y1="${y(v).toFixed(1)}" x2="${W - padR}" y2="${y(v).toFixed(1)}" class="tl-grid"/><text x="2" y="${(y(v) + 3).toFixed(1)}" class="an-axis mono">${v}</text>`).join('')}
+    <line x1="${padL}" y1="${thresholdY.toFixed(1)}" x2="${W - padR}" y2="${thresholdY.toFixed(1)}" class="perf-threshold-line"/>
+    <text x="${(W - padR).toFixed(1)}" y="${(thresholdY - 4).toFixed(1)}" text-anchor="end" class="an-axis mono" style="fill:var(--amber)">min ${threshold}</text>
+    <path d="${polyPath(pts)}" class="tl-line"/>
+    ${pts.map((p, i) => `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.2" fill="${records[i].belowMinimum ? 'var(--red)' : 'var(--primary)'}" class="tl-pt"/>`).join('')}
+    ${records.map((r, i) => `<text x="${x(i).toFixed(1)}" y="${H - 6}" text-anchor="middle" class="an-axis mono">${escapeHtml(periodLabel(r.period).slice(0, 3))}</text>`).join('')}
+  </svg>`;
+}
+function ghaPerformanceTabHtml(g) {
+  const config = getActiveGhaPerfConfig();
+  const period = currentPeriod();
+  const rec = getGhaPerfRecord(g.id, period);
+  if (!rec) return `<div class="dw-section" style="margin-top:0"><p class="rs-none">No performance data computed yet for this period.</p></div>`;
+  const threshold = config.params.minimumThreshold;
+  const weights = config.params.metricWeights;
+  const metricOrder = ['deployment', 'serviceability', 'suitability', 'fuelEfficiency'];
+  const weakest = ghaWeakestMetric(rec.metrics);
+
+  const bars = metricOrder.map(k => {
+    const score = rec.metrics[k];
+    const isWeak = k === weakest.key && rec.belowMinimum;
+    const tier = ghaScoreTier(score, threshold);
+    const color = tier === 'green' ? 'var(--green)' : tier === 'amber' ? 'var(--amber)' : 'var(--red)';
+    return `<div class="contrib-row ${isWeak ? 'dominant' : ''}">
+      <div class="cr-top"><span class="cr-name">${ghaMetricLabel(k)}${isWeak ? ' <span class="cr-tag">WEAKEST</span>' : ''}
+        <span class="mono" style="font-size:10px;color:var(--text-mute);margin-left:6px">weight ${Math.round(weights[k] * 100)}%</span></span>
+        <span class="cr-share mono">${score}%</span></div>
+      <div class="cr-bar"><span class="cr-fill" style="width:${score}%;--accent:${color}"></span></div>
+      <div class="cr-meta mono">${escapeHtml(rec.detail[k])}</div>
+    </div>`;
+  }).join('');
+
+  const trendData = last6Periods(period).map(p => getGhaPerfRecord(g.id, p)).filter(Boolean);
+
+  return `<div class="dw-section" style="margin-top:0;text-align:center">
+      <div style="display:flex;justify-content:center">${perfRingHtml(rec.overallScore, threshold, 108, 30)}</div>
+      <p class="mono" style="margin-top:8px;font-size:12px;color:var(--text-mute)">Overall score · ${escapeHtml(periodLabel(period))}</p>
+      ${rec.belowMinimum ? `<div class="form-msg error" style="margin-top:10px;text-align:left">⚠ Below the ${threshold} minimum — driven by low ${weakest.label.toLowerCase()} (${weakest.score}%).</div>` : ''}
+    </div>
+    <div class="dw-section"><h4>Sub-metric breakdown</h4>
+      <div class="contrib-rows">${bars}</div>
+    </div>
+    <div class="dw-section"><h4>6-month trend</h4>
+      <div class="an-chart">${ghaTrendChartSVG(trendData, threshold)}</div>
+    </div>`;
+}
+
+function ghaCertificationTabHtml(g) {
+  const config = getActiveGhaPerfConfig();
+  const evalResult = evaluateGhoEligibility(g.id);
+  const current = currentGhoCertificate(g.id);
+  const history = ghoCertificateHistory(g.id);
+  const statusInfo = ghoStatusInfo(ghaCertStatus(g.id));
+
+  return `<div class="dw-section" style="margin-top:0">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+        <span class="gho-badge ${statusInfo.cls}" style="font-size:13px;padding:6px 12px">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${GHO_BADGE_ICON[statusInfo.cls]}</svg>
+          ${statusInfo.label}
+        </span>
+        ${current ? `<button class="btn btn-primary btn-sm" id="gha-view-cert" type="button">View Certificate</button>` : ''}
+      </div>
+      ${current ? `<p class="mono" style="font-size:11.5px;color:var(--text-mute);margin-top:8px">${escapeHtml(current.certificateNumber)} · valid until ${fmtDate(current.expiresAt)}</p>` : ''}
+    </div>
+
+    <div class="dw-section"><h4>Eligibility breakdown</h4>
+      <div class="dw-grid">
+        <div class="dw-item"><div class="k">Trailing average</div><div class="v mono">${evalResult.trailingAverageScore}% <span style="color:var(--text-mute)">/ ${config.params.ghoAnnualThreshold}% required</span></div></div>
+        <div class="dw-item"><div class="k">Months below minimum</div><div class="v mono">${evalResult.monthsBelow} <span style="color:var(--text-mute)">/ ${config.params.ghoMaxMonthsBelow} allowed</span></div></div>
+        <div class="dw-item"><div class="k">Window</div><div class="v mono">${evalResult.monthsAvailable} month${evalResult.monthsAvailable === 1 ? '' : 's'} available${evalResult.monthsAvailable < 12 ? ' (partial)' : ''}</div></div>
+        <div class="dw-item"><div class="k">Eligible now</div><div class="v">${evalResult.eligible ? '<span class="eq-status es-ok">YES</span>' : '<span class="eq-status es-bad">NO</span>'}</div></div>
+      </div>
+      ${!evalResult.eligible && evalResult.reasonIneligible ? `<div class="form-msg error" style="margin-top:10px">⚠ ${escapeHtml(evalResult.reasonIneligible)}</div>` : ''}
+      <div class="dw-perms" style="margin-top:12px">
+        <span class="dw-perm">Deployment ${evalResult.basisMetrics.deployment}%</span>
+        <span class="dw-perm">Serviceability ${evalResult.basisMetrics.serviceability}%</span>
+        <span class="dw-perm">Suitability ${evalResult.basisMetrics.suitability}%</span>
+        <span class="dw-perm">Fuel Eff. ${evalResult.basisMetrics.fuelEfficiency}%</span>
+      </div>
+    </div>
+
+    <div class="dw-section"><h4>Certificate history</h4>
+      ${history.length ? `<div id="gha-cert-history">${history.map(c => {
+    const info = ghoStatusInfo(c.status);
+    return `<div class="cert-hist-row" data-cert-id="${c.id}">
+          <span class="gho-badge ${info.cls}"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${GHO_BADGE_ICON[info.cls]}</svg>${info.label}</span>
+          <span class="mono" style="font-size:12px">${escapeHtml(c.certificateNumber)}</span>
+          <span class="mono" style="font-size:11px;color:var(--text-mute)">${fmtDate(c.issuedAt)} → ${fmtDate(c.expiresAt)}</span>
+        </div>`;
+  }).join('')}</div>` : '<p class="rs-none">No certificates issued yet.</p>'}
+    </div>`;
+}
+
+/* opens the shell (avatar/name/badges/tabs) exactly once — tab switches
+   only repaint #gha-detail-content below, so the modal never rebuilds (and
+   never replays its pop-in animation) just from clicking between tabs;
+   only actions that actually change data (reassign, edit, status change)
+   go through a full reopen. */
+function openGhaDetail(id) {
+  const g = getGha(id); if (!g) return;
+  const color = ghaColorFor(id);
+
+  ghaDetailOpenId = id;
+  const modal = openModal(`
+    <div class="modal-head">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div class="drawer-avatar" style="width:40px;height:40px;font-size:14px;margin-bottom:0;background:color-mix(in srgb, ${color} 16%, transparent);color:${color}">${escapeHtml(g.code.slice(0, 3))}</div>
+        <div><h3>${escapeHtml(g.name)}</h3><p class="mono">${escapeHtml(g.licenseNumber)}</p></div>
+      </div>
+      <button class="modal-x" data-x aria-label="Close"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6 L18 18 M18 6 L6 18"/></svg></button>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:-8px 0 16px">${ghaStatusBadge(g.status)}${ghaOwnershipBadge(g.ownership)}</div>
+
+    <div class="gse-cat-tabs" id="gha-dw-tabs">
+      <button type="button" class="gct-tab ${ghaDetailTab === 'overview' ? 'active' : ''}" data-ghatab="overview">Overview</button>
+      <button type="button" class="gct-tab ${ghaDetailTab === 'equipment' ? 'active' : ''}" data-ghatab="equipment">Equipment (${ghaFleetBreakdown(id).total})</button>
+      <button type="button" class="gct-tab ${ghaDetailTab === 'performance' ? 'active' : ''}" data-ghatab="performance">Performance</button>
+      <button type="button" class="gct-tab ${ghaDetailTab === 'certification' ? 'active' : ''}" data-ghatab="certification">Certification</button>
+      <button type="button" class="gct-tab ${ghaDetailTab === 'contract' ? 'active' : ''}" data-ghatab="contract">Contract</button>
+    </div>
+    <div id="gha-detail-content"></div>`, true);
+  modal.classList.add('gha-detail-modal');
+
+  const closeGhaDetail = () => { ghaDetailOpenId = null; closeModal(); };
+  const host = document.getElementById('modal-host');
+  host.onclick = e => { if (e.target === host) closeGhaDetail(); };
+  modal.querySelectorAll('[data-x]').forEach(b => b.onclick = closeGhaDetail);
+  modal.querySelector('#gha-dw-tabs').onclick = e => {
+    const b = e.target.closest('[data-ghatab]'); if (!b || b.dataset.ghatab === ghaDetailTab) return;
+    ghaDetailTab = b.dataset.ghatab;
+    modal.querySelectorAll('[data-ghatab]').forEach(x => x.classList.toggle('active', x === b));
+    paintGhaDetailTab(g, modal);
+  };
+
+  paintGhaDetailTab(g, modal);
+}
+
+/* repaints just #gha-detail-content for the active tab and wires that
+   tab's own controls — called on open and on every tab switch, never
+   touches the modal shell itself. */
+function paintGhaDetailTab(g, modal) {
+  const id = g.id;
+  ghaReassignSelection = new Set();
+  const { units, cats, total } = ghaFleetBreakdown(id);
+  const otherGhas = getGhas().filter(x => x.id !== id);
+  const contract = ghaContractState(g);
+  const color = ghaColorFor(id);
+
+  const tabHtml = ghaDetailTab === 'equipment' ? ghaEquipmentTabHtml(g, units, cats, total, otherGhas, color)
+    : ghaDetailTab === 'performance' ? ghaPerformanceTabHtml(g)
+      : ghaDetailTab === 'certification' ? ghaCertificationTabHtml(g)
+        : ghaDetailTab === 'contract' ? ghaContractTabHtml(g, contract)
+          : ghaOverviewTabHtml(g);
+  modal.querySelector('#gha-detail-content').innerHTML = tabHtml;
+
+  if (ghaDetailTab === 'overview') { modal.querySelector('#gha-dw-edit').onclick = () => openGhaModal(id); animatePerfRings(modal); }
+  if (ghaDetailTab === 'performance') animatePerfRings(modal);
+  if (ghaDetailTab === 'certification') {
+    const viewBtn = modal.querySelector('#gha-view-cert');
+    const current = currentGhoCertificate(id);
+    if (viewBtn && current) viewBtn.onclick = () => openCertificateView(current.id, id);
+    const histEl = modal.querySelector('#gha-cert-history');
+    if (histEl) histEl.onclick = e => {
+      const row = e.target.closest('[data-cert-id]'); if (row) openCertificateView(row.dataset.certId, id);
+    };
+  }
+
+  if (ghaDetailTab === 'equipment' && total) {
+    const tbody = modal.querySelector('#gha-unit-body');
+    const checkAll = modal.querySelector('#gha-check-all');
+    const bar = modal.querySelector('#gha-reassign-bar');
+    const nEl = modal.querySelector('#gha-reassign-n');
+    function syncBar() {
+      bar.hidden = ghaReassignSelection.size === 0;
+      nEl.textContent = String(ghaReassignSelection.size);
+      checkAll.checked = units.length > 0 && units.every(u => ghaReassignSelection.has(u.id));
+    }
+    tbody.onclick = e => {
+      const check = e.target.closest('[data-check]'); if (!check) return;
+      if (check.checked) ghaReassignSelection.add(check.dataset.check); else ghaReassignSelection.delete(check.dataset.check);
+      syncBar();
+    };
+    checkAll.onchange = e => {
+      tbody.querySelectorAll('[data-check]').forEach(c => { c.checked = e.target.checked; if (e.target.checked) ghaReassignSelection.add(c.dataset.check); else ghaReassignSelection.delete(c.dataset.check); });
+      syncBar();
+    };
+    modal.querySelector('#gha-reassign-clear').onclick = () => {
+      ghaReassignSelection.clear();
+      tbody.querySelectorAll('[data-check]').forEach(c => c.checked = false);
+      syncBar();
+    };
+    modal.querySelector('#gha-reassign-go').onclick = () => {
+      const targetId = modal.querySelector('#gha-reassign-target').value || null;
+      const targetGha = targetId ? getGha(targetId) : null;
+      const targetName = targetGha ? targetGha.name : 'Unassigned';
+      const ids = [...ghaReassignSelection];
+      if (!ids.length) return;
+      const fleet = getGse();
+      ids.forEach(unitId => { const u = fleet.find(x => x.id === unitId); if (u) u.ghaId = targetId; });
+      saveGse(fleet);
+      logActivity({ action: `reassigned ${ids.length} unit(s) to ${targetName}`, target: g.name, category: 'gha', severity: 'info' });
+      showToast(`${ids.length} unit(s) reassigned to ${targetName}`, 'success');
+      if (currentModule === 'equipment') renderEquipmentBody();
+      if (currentModule === 'gse') showModule('gse');
+      if (currentModule === 'gha') paintGhaManagement(document.querySelector('.module-view'));
+      openGhaDetail(id);
+    };
+  }
 }
 
 /* ═══ weight-version write helpers (append-only) ═══════════ */
@@ -4108,5 +7843,714 @@ function exportOutcomesCSV() {
   download('orbis-outcomes.csv', csv, 'text/csv'); showToast('Outcomes exported as CSV', 'success');
 }
 function exportOutcomesJSON() { download('orbis-outcomes.json', JSON.stringify(getOutcomes(), null, 2), 'application/json'); showToast('Outcomes exported as JSON', 'success'); }
+
+/* ═══ S10 — LOADSHEET (key: loadsheet) ═══════════════════════ */
+let loadsheetSelectedFlightId = null;
+let loadsheetTab = 'ls';
+
+function lsStatusInfo(status) {
+  return {
+    DRAFT: { label: 'Draft', cls: 'ls-st-DRAFT' },
+    PREPARED: { label: 'Prepared', cls: 'ls-st-PREPARED' },
+    APPROVED: { label: 'Approved', cls: 'ls-st-APPROVED' },
+    SUPERSEDED_BY_LMC: { label: 'Superseded by LMC', cls: 'ls-st-SUPERSEDED' }
+  }[status] || { label: status, cls: '' };
+}
+function lsBadge(status) { const s = lsStatusInfo(status); return `<span class="ls-badge ${s.cls}">${escapeHtml(s.label)}</span>`; }
+
+function buildFreshLoadsheet(f) {
+  const ref = lsRefFor(f.aircraftType);
+  return {
+    id: uid('ls'), flightId: f.id, flightNumber: f.flightNumber,
+    acReg: '', acType: f.aircraftType, version: 'A', from: 'MUX', to: '', crew: '',
+    priorityAddresses: '', originator: '', recharge: 'N', initials: '',
+    status: 'DRAFT', preparedBy: null, preparedByUserId: null, preparedAt: null,
+    approvedBy: null, approvedByUserId: null, approvedAt: null,
+    weightBuildup: {
+      basicWeight: ref.dowDefault.basicWeight, crewWeight: ref.dowDefault.crewWeight, pantryWeight: ref.dowDefault.pantryWeight,
+      takeoffFuel: ref.fuelDefault.takeoffFuel, tripFuel: ref.fuelDefault.tripFuel,
+      maxZeroFuelWeight: ref.mzfw, maxTakeoffWeight: ref.mtow, maxLandingWeight: ref.mlw
+    },
+    destinations: [{
+      dest: '', pax: { male: 0, female: 0, child: 0, infant: 0 }, cabBag: 0,
+      distributionWeights: [0, 0, 0, 0, 0, 0], rows: { tr: 0, b: 0, c: 0, m: 0 },
+      remarks: { pax: 'Y', pad: 'N' }
+    }],
+    notes: '',
+    lastMinuteChanges: [],
+    loadAndTrim: { dryOperatingWeightHArm: ref.dowHArmDefault, weightDeviation: { E: 0, F: 0, G: 0, H: 0 } }
+  };
+}
+
+function lsTimelineHtml(ls) {
+  const stages = [
+    { label: 'Draft', done: true, at: null },
+    { label: 'Prepared', done: !!ls.preparedAt, at: ls.preparedAt },
+    { label: 'Approved', done: !!ls.approvedAt, at: ls.approvedAt }
+  ];
+  if (ls.lastMinuteChanges && ls.lastMinuteChanges.length) {
+    const lastLmc = ls.lastMinuteChanges[ls.lastMinuteChanges.length - 1];
+    stages.push({ label: 'LMC applied', done: true, at: lastLmc.enteredAt });
+    stages.push({ label: 'Re-approved', done: ls.status === 'APPROVED' && ls.approvedAt && new Date(ls.approvedAt) > new Date(lastLmc.enteredAt), at: null });
+  }
+  return `<div class="ls-timeline">${stages.map((s, i) => `
+    ${i ? '<span class="ls-tl-conn"></span>' : ''}
+    <div class="ls-tl-stage ${s.done ? 'done' : 'pending'}">
+      <span class="ls-tl-dot"></span><span class="ls-tl-label">${escapeHtml(s.label)}</span>
+      ${s.at ? `<span class="ls-tl-time mono">${fmtDateTime(s.at)}</span>` : ''}
+    </div>`).join('')}</div>`;
+}
+
+function lsSeatingCondLabel(ref, mac, weightKg) {
+  const env = ref.envelope;
+  if (!lsPointInPolygon(mac, weightKg, env)) return 'OUT OF LIMITS';
+  const frac = (weightKg - env[5].weightKg) / Math.max(1, env[1].weightKg - env[5].weightKg);
+  const fwdAt = env[0].mac + (env[1].mac - env[0].mac) * ENGINE.clamp(frac, 0, 1);
+  const aftAt = env[5].mac + (env[4].mac - env[5].mac) * ENGINE.clamp(frac, 0, 1);
+  const mid = (fwdAt + aftAt) / 2, span = Math.max(1, aftAt - fwdAt);
+  const pos = (mac - mid) / (span / 2);
+  if (pos < -0.35) return 'FWD-BIASED';
+  if (pos > 0.35) return 'AFT-BIASED';
+  return 'NORMAL';
+}
+
+function renderLoadsheet(el) {
+  const flights = getFlights().slice().sort((a, b) => a.flightNumber.localeCompare(b.flightNumber));
+  if (!flights.length) { el.innerHTML = emptyState('No flights', 'There are no flights to prepare a loadsheet for yet.'); return; }
+  if (!loadsheetSelectedFlightId || !flights.some(x => x.id === loadsheetSelectedFlightId)) {
+    const withLs = flights.find(x => getLoadsheetByFlight(x.id));
+    loadsheetSelectedFlightId = (withLs || flights[0]).id;
+  }
+  const f = getFlight(loadsheetSelectedFlightId);
+  const ref = lsRefFor(f.aircraftType);
+  const lsAll = getLoadsheets();
+  let ls = lsAll.find(x => x.flightId === f.id);
+  if (!ls) { ls = buildFreshLoadsheet(f); lsAll.push(ls); saveLoadsheets(lsAll); }
+
+  const locked = ls.status !== 'DRAFT';
+  const validation = lsValidate(ls, ref);
+
+  el.innerHTML = `
+    <div class="mod-wide ls-mod">
+      <div class="mod-head">
+        <div><h1 class="mod-title">Loadsheet</h1>
+          <p class="mod-sub">Loadsheet &amp; Load Message + Load and Trim Sheet · <strong>prototype/demo document — not a certified regulatory instrument</strong></p></div>
+        <select class="ls-flight-select" id="ls-flight-select">
+          ${flights.map(x => `<option value="${x.id}" ${x.id === f.id ? 'selected' : ''}>${escapeHtml(x.flightNumber)} · ${escapeHtml(x.aircraftType)}${getLoadsheetByFlight(x.id) ? '' : ' (new)'}</option>`).join('')}
+        </select>
+      </div>
+
+      ${lsTimelineHtml(ls)}
+
+      <div class="ls-workflow-bar">
+        <div class="ls-validation-block">
+          <div class="ls-validation ${validation.ok ? 'ok' : 'bad'}" id="ls-validation">${validation.ok ? '✓ All safety checks passed — approvable.' : `VALIDATION_FAILED · ${validation.issues.length} issue${validation.issues.length > 1 ? 's' : ''}`}</div>
+          ${!validation.ok ? `<ul class="ls-issues" id="ls-issues">${validation.issues.map(i => `<li>${escapeHtml(i)}</li>`).join('')}</ul>` : `<ul class="ls-issues" id="ls-issues" hidden></ul>`}
+        </div>
+        <div class="ls-workflow-actions">
+          ${ls.status === 'DRAFT' ? `<button class="btn btn-primary" id="ls-prepare-btn" type="button">Mark as Prepared</button>` : ''}
+          ${ls.status === 'PREPARED' ? `<button class="btn btn-ghost" id="ls-unlock-btn" type="button">Unlock (revert to Draft)</button>` : ''}
+          ${(ls.status === 'PREPARED' || ls.status === 'SUPERSEDED_BY_LMC') ? `<button class="btn btn-primary" id="ls-approve-btn" type="button" ${validation.ok ? '' : 'disabled'}>${ls.status === 'SUPERSEDED_BY_LMC' ? 'Re-approve' : 'Approve'}</button>` : ''}
+        </div>
+      </div>
+
+      <div class="ls-tabbar">
+        <button class="gct-tab ls-tab-btn ${loadsheetTab === 'ls' ? 'active' : ''}" data-lstab="ls" type="button">Loadsheet &amp; Load Message</button>
+        <button class="gct-tab ls-tab-btn ${loadsheetTab === 'lt' ? 'active' : ''}" data-lstab="lt" type="button">Load and Trim Sheet</button>
+      </div>
+
+      <div class="ls-pane" id="ls-pane-ls" ${loadsheetTab === 'ls' ? '' : 'hidden'}>${lsTab1Html(f, ls, ref, locked)}</div>
+      <div class="ls-pane" id="ls-pane-lt" ${loadsheetTab === 'lt' ? '' : 'hidden'}>${lsTab2Html(ls, ref)}</div>
+    </div>`;
+
+  wireLoadsheet(el, ls, ref, lsAll, f);
+}
+
+function lsTab1Html(f, ls, ref, locked) {
+  const wt = computeWeightTotals(ls);
+  const dis = locked ? 'disabled' : '';
+  return `
+    <section class="card ls-header-strip">
+      <div class="ls-hdr-cap mono">ALL WEIGHTS IN KILOGRAMS</div>
+      <div class="ls-hdr-grid">
+        <div class="ls-hf"><label>Flight</label><span class="mono">${escapeHtml(ls.flightNumber)}</span></div>
+        <div class="ls-hf"><label>A/C Reg.</label><input class="mono" type="text" data-lsf="acReg" value="${escapeHtml(ls.acReg)}" ${dis}/></div>
+        <div class="ls-hf"><label>Version</label><input class="mono" type="text" data-lsf="version" value="${escapeHtml(ls.version)}" ${dis} maxlength="4"/></div>
+        <div class="ls-hf"><label>Crew</label><input class="mono" type="text" data-lsf="crew" value="${escapeHtml(ls.crew)}" ${dis}/></div>
+        <div class="ls-hf"><label>Date</label><span class="mono">${fmtDate(f.std || f.eibt)}</span></div>
+        <div class="ls-hf"><label>From / To</label><span class="mono"><input class="mono ls-inline-sm" type="text" data-lsf="from" value="${escapeHtml(ls.from)}" ${dis}/> → <input class="mono ls-inline-sm" type="text" data-lsf="to" value="${escapeHtml(ls.to)}" ${dis}/></span></div>
+        <div class="ls-hf"><label>Prepared By</label><span class="mono">${ls.preparedBy ? `${escapeHtml(ls.preparedBy)} · ${fmtDateTime(ls.preparedAt)}` : '—'}</span></div>
+        <div class="ls-hf"><label>Approved By</label><span class="mono">${ls.approvedBy ? `${escapeHtml(ls.approvedBy)} · ${fmtDateTime(ls.approvedAt)}` : '—'}</span></div>
+        <div class="ls-hf"><label>Originator</label><input class="mono" type="text" data-lsf="originator" value="${escapeHtml(ls.originator)}" ${dis}/></div>
+        <div class="ls-hf"><label>Priority Addresses</label><input class="mono" type="text" data-lsf="priorityAddresses" value="${escapeHtml(ls.priorityAddresses)}" ${dis}/></div>
+        <div class="ls-hf"><label>Recharge</label>
+          <select data-lsf="recharge" ${dis}><option value="N" ${ls.recharge === 'N' ? 'selected' : ''}>N</option><option value="Y" ${ls.recharge === 'Y' ? 'selected' : ''}>Y</option></select></div>
+        <div class="ls-hf"><label>Initials</label><input class="mono" type="text" data-lsf="initials" value="${escapeHtml(ls.initials)}" ${dis} maxlength="6"/></div>
+      </div>
+    </section>
+
+    <section class="card ls-wb-card">
+      <h3 class="card-h">Weight buildup</h3>
+      <div class="ls-wb-grid">
+        <div class="ls-wb-col">
+          <div class="ls-wb-row"><span>Basic Weight</span><input type="number" data-lsf="weightBuildup.basicWeight" value="${ls.weightBuildup.basicWeight}" ${dis}/></div>
+          <div class="ls-wb-row"><span>Crew</span><input type="number" data-lsf="weightBuildup.crewWeight" value="${ls.weightBuildup.crewWeight}" ${dis}/></div>
+          <div class="ls-wb-row"><span>Pantry</span><input type="number" data-lsf="weightBuildup.pantryWeight" value="${ls.weightBuildup.pantryWeight}" ${dis}/></div>
+          <div class="ls-wb-row computed"><span>= Dry Operating Weight</span><span class="mono" id="ls-dow">${lsKg(wt.dryOperatingWeight)}</span></div>
+          <div class="ls-wb-row"><span>Take-off Fuel (+)</span><input type="number" data-lsf="weightBuildup.takeoffFuel" value="${ls.weightBuildup.takeoffFuel}" ${dis}/></div>
+          <div class="ls-wb-row computed"><span>= Operating Weight</span><span class="mono" id="ls-ow">${lsKg(wt.operatingWeight)}</span></div>
+        </div>
+        <div class="ls-wb-col">
+          <div class="ls-wb-row"><span>Max Weight — Zero Fuel</span><input type="number" data-lsf="weightBuildup.maxZeroFuelWeight" value="${ls.weightBuildup.maxZeroFuelWeight}" ${dis}/></div>
+          <div class="ls-wb-row"><span>Max Weight — Takeoff</span><input type="number" data-lsf="weightBuildup.maxTakeoffWeight" value="${ls.weightBuildup.maxTakeoffWeight}" ${dis}/></div>
+          <div class="ls-wb-row"><span>Max Weight — Landing</span><input type="number" data-lsf="weightBuildup.maxLandingWeight" value="${ls.weightBuildup.maxLandingWeight}" ${dis}/></div>
+          <div class="ls-wb-row"><span>Take-off Fuel</span><span class="mono" id="ls-of-fuel">${lsKg(ls.weightBuildup.takeoffFuel)}</span></div>
+          <div class="ls-wb-row computed"><span>= Allowed Weight for Takeoff <span class="mono ls-bind-tag" id="ls-awt-bind" title="${escapeHtml(wt.bindingLabel)}">(${wt.binding})</span></span><span class="mono" id="ls-awt">${lsKg(wt.allowedWeightForTakeoff)}</span></div>
+          <div class="ls-wb-row"><span>Operating Weight (−)</span><span class="mono" id="ls-ow2">${lsKg(wt.operatingWeight)}</span></div>
+          <div class="ls-wb-row computed"><span>= Allowed Traffic Load</span><span class="mono" id="ls-atl">${lsKg(wt.allowedTrafficLoad)}</span></div>
+          <div class="ls-wb-row"><span>Trip Fuel</span><input type="number" data-lsf="weightBuildup.tripFuel" value="${ls.weightBuildup.tripFuel}" ${dis}/></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card ls-dest-card">
+      <h3 class="card-h">Destination / traffic distribution ${!locked ? `<button class="btn btn-ghost btn-sm" id="ls-add-dest" type="button" style="margin-left:auto">+ Add destination</button>` : ''}</h3>
+      <div id="ls-dest-list">${ls.destinations.map((d, i) => lsDestinationBlockHtml(d, i, locked, ls.destinations.length)).join('')}</div>
+    </section>
+
+    <section class="card ls-totals-card">
+      <h3 class="card-h">Totals</h3>
+      <div id="ls-totals-ledger">${lsTotalsLedgerHtml(ls, wt)}</div>
+    </section>
+
+    <section class="card ls-lmc-card">
+      <h3 class="card-h">Last minute changes</h3>
+      <div id="ls-lmc-block">${lsLmcBlockHtml(ls)}</div>
+    </section>
+
+    <section class="card ls-notes-card">
+      <h3 class="card-h">Notes &amp; balance / seating condition</h3>
+      <div class="ls-notes-grid">
+        <textarea class="ls-notes" data-lsf="notes" ${dis} placeholder="Notes…">${escapeHtml(ls.notes || '')}</textarea>
+        <div class="ls-balance-box" id="ls-balance-box">${lsBalanceBoxHtml(ls, ref, wt)}</div>
+      </div>
+    </section>`;
+}
+
+function lsDestinationBlockHtml(d, i, locked, count) {
+  const dis = locked ? 'disabled' : '';
+  const paxTotal = (Number(d.pax.male) || 0) + (Number(d.pax.female) || 0) + (Number(d.pax.child) || 0) + (Number(d.pax.infant) || 0);
+  const rowTotal = (Number(d.rows.tr) || 0) + (Number(d.rows.b) || 0) + (Number(d.rows.c) || 0) + (Number(d.rows.m) || 0);
+  return `<div class="ls-dest-block">
+    <div class="ls-dest-head">
+      <span class="ls-dest-tag">${i + 1}</span>
+      <input class="mono ls-dest-name" type="text" placeholder="Destination" data-lsf="destinations.${i}.dest" value="${escapeHtml(d.dest)}" ${dis}/>
+      ${count > 1 && !locked ? `<button class="ls-dest-remove" data-remove-dest="${i}" type="button" title="Remove destination">×</button>` : ''}
+    </div>
+
+    <div class="ls-dest-sub">
+      <div class="ls-dest-subhead"><span>Passengers</span><span class="ls-dest-total">Total <span class="mono" id="ls-dpax-${i}">${paxTotal}</span></span></div>
+      <div class="ls-dest-pax-row">
+        <label class="ls-pax-tile">Male<input type="number" data-lsf="destinations.${i}.pax.male" value="${d.pax.male}" ${dis}/></label>
+        <label class="ls-pax-tile">Female<input type="number" data-lsf="destinations.${i}.pax.female" value="${d.pax.female}" ${dis}/></label>
+        <label class="ls-pax-tile">Child<input type="number" data-lsf="destinations.${i}.pax.child" value="${d.pax.child}" ${dis}/></label>
+        <label class="ls-pax-tile">Infant<input type="number" data-lsf="destinations.${i}.pax.infant" value="${d.pax.infant}" ${dis}/></label>
+        <span class="ls-pax-divider"></span>
+        <label class="ls-pax-tile ls-pax-tile-bag">Cab Bag (kg)<input type="number" data-lsf="destinations.${i}.cabBag" value="${d.cabBag}" ${dis}/></label>
+      </div>
+    </div>
+
+    <div class="ls-dest-sub">
+      <div class="ls-dest-subhead"><span>Distribution weights</span></div>
+      <div class="ls-dist-row">
+        ${d.distributionWeights.map((w, wi) => `<label>DW${wi + 1}<input type="number" data-lsf="destinations.${i}.distributionWeights.${wi}" value="${w}" ${dis}/></label>`).join('')}
+      </div>
+    </div>
+
+    <div class="ls-dest-sub">
+      <div class="ls-dest-subhead"><span>Compartments &amp; remarks</span><span class="ls-dest-total">T <span class="mono" id="ls-dtot-${i}">${lsKg(rowTotal)}</span></span></div>
+      <div class="ls-cat-row">
+        <label>Tr<input type="number" data-lsf="destinations.${i}.rows.tr" value="${d.rows.tr}" ${dis}/></label>
+        <label>B<input type="number" data-lsf="destinations.${i}.rows.b" value="${d.rows.b}" ${dis}/></label>
+        <label>C<input type="number" data-lsf="destinations.${i}.rows.c" value="${d.rows.c}" ${dis}/></label>
+        <label>M<input type="number" data-lsf="destinations.${i}.rows.m" value="${d.rows.m}" ${dis}/></label>
+        <label class="ls-remark">PAX <select data-lsf="destinations.${i}.remarks.pax" ${dis}><option ${d.remarks.pax === 'Y' ? 'selected' : ''}>Y</option><option ${d.remarks.pax === 'N' ? 'selected' : ''}>N</option></select></label>
+        <label class="ls-remark">PAD <select data-lsf="destinations.${i}.remarks.pad" ${dis}><option ${d.remarks.pad === 'Y' ? 'selected' : ''}>Y</option><option ${d.remarks.pad === 'N' ? 'selected' : ''}>N</option></select></label>
+      </div>
+    </div>
+  </div>`;
+}
+
+function lsKg(n) { return Math.round(n || 0).toLocaleString() + ' kg'; }
+
+function lsTotalsLedgerHtml(ls, wt) {
+  const zfwLmc = wt.zeroFuelWeight, towLmc = wt.takeoffWeight, lwLmc = wt.landingWeight;
+  const zfwBad = zfwLmc > ls.weightBuildup.maxZeroFuelWeight, towBad = towLmc > ls.weightBuildup.maxTakeoffWeight, lwBad = lwLmc > ls.weightBuildup.maxLandingWeight, tlBad = (wt.totalTrafficLoad + wt.lmcTotal) > wt.allowedTrafficLoad;
+  return `
+    <div class="ls-ledger-row"><span>Total Passenger Weight (+)</span><span class="mono">${lsKg(wt.totalPassengerWeight)}</span></div>
+    <div class="ls-ledger-row ${tlBad ? 'bad' : ''}"><span>= Total Traffic Load</span><span class="mono">${lsKg(wt.totalTrafficLoad)}</span></div>
+    <div class="ls-ledger-row"><span>Dry Operating Weight (+)</span><span class="mono">${lsKg(wt.dryOperatingWeight)}</span></div>
+    <div class="ls-ledger-row ${zfwBad ? 'bad' : ''}"><span>= Zero Fuel Weight ${wt.lmcTotal ? `<span class="ls-lmc-tag">± LMC ${fmtSigned(wt.lmcTotal)}</span>` : ''}</span><span class="mono">${lsKg(zfwLmc)}</span></div>
+    <div class="ls-ledger-row"><span>Take-off Fuel (+)</span><span class="mono">${lsKg(ls.weightBuildup.takeoffFuel)}</span></div>
+    <div class="ls-ledger-row ${towBad ? 'bad' : ''}"><span>= Take-off Weight ${wt.lmcTotal ? `<span class="ls-lmc-tag">± LMC ${fmtSigned(wt.lmcTotal)}</span>` : ''}</span><span class="mono">${lsKg(towLmc)}</span></div>
+    <div class="ls-ledger-row"><span>Trip Fuel (−)</span><span class="mono">${lsKg(ls.weightBuildup.tripFuel)}</span></div>
+    <div class="ls-ledger-row ${lwBad ? 'bad' : ''}"><span>= Landing Weight ${wt.lmcTotal ? `<span class="ls-lmc-tag">± LMC ${fmtSigned(wt.lmcTotal)}</span>` : ''}</span><span class="mono">${lsKg(lwLmc)}</span></div>
+    <div class="ls-ledger-divider"></div>
+    <div class="ls-ledger-row"><span>Allowed Traffic Load</span><span class="mono">${lsKg(wt.allowedTrafficLoad)}</span></div>
+    <div class="ls-ledger-row ${wt.underloadBeforeLMC < 0 ? 'bad' : ''}"><span>Underload Before LMC</span><span class="mono">${lsKg(wt.underloadBeforeLMC)}</span></div>
+    <div class="ls-ledger-row"><span>Total Passengers</span><span class="mono">${wt.totalPassengers}</span></div>`;
+}
+
+function lsLmcBlockHtml(ls) {
+  const rows = ls.lastMinuteChanges || [];
+  const enabled = ls.status !== 'DRAFT';
+  return `
+    <table class="cmp-tbl ls-lmc-tbl">
+      <thead><tr><th>Dest</th><th>Specification</th><th>Compartment</th><th>± Weight</th><th>By</th><th>At</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `<tr><td>${escapeHtml(r.dest)}</td><td>${escapeHtml(r.specification)}</td><td class="mono">${escapeHtml(r.compartment)}</td><td class="mono">${fmtSigned(r.weightDelta)} kg</td><td>${escapeHtml(r.enteredBy)}</td><td class="mono">${hhmm(r.enteredAt)}</td></tr>`).join('')}
+        <tr class="ls-lmc-total-row"><td colspan="3">LMC Total</td><td class="mono" id="ls-lmc-total">${fmtSigned(lsSum(rows.map(x => x.weightDelta)))} kg</td><td colspan="2"></td></tr>
+      </tbody>
+    </table>
+    ${enabled ? `
+    <div class="ls-lmc-add">
+      <input class="mono" type="text" id="ls-lmc-dest" placeholder="Dest"/>
+      <input type="text" id="ls-lmc-spec" placeholder="Specification"/>
+      <input class="mono" type="text" id="ls-lmc-comp" placeholder="Compartment"/>
+      <input class="mono" type="number" id="ls-lmc-wt" placeholder="± kg"/>
+      <button class="btn btn-primary btn-sm" id="ls-lmc-add-btn" type="button">Add LMC</button>
+    </div>` : `<p class="rs-none">Available once the loadsheet has been prepared.</p>`}`;
+}
+
+function lsBalanceBoxHtml(ls, ref, wt) {
+  const lat = computeLoadAndTrim(ls, ref);
+  const cond = lsSeatingCondLabel(ref, lat.cgPercentMacTakeoff, wt.takeoffWeight);
+  return `
+    <div class="ls-bal-row"><span>ZFW %MAC</span><span class="mono">${lat.cgPercentMacZFW}%</span></div>
+    <div class="ls-bal-row"><span>TOW %MAC</span><span class="mono">${lat.cgPercentMacTakeoff}%</span></div>
+    <div class="ls-bal-row"><span>Seating Cond.</span><span class="mono ${cond === 'OUT OF LIMITS' ? 'bad' : ''}">${cond}</span></div>`;
+}
+
+/* ──────── TAB 2 · LOAD AND TRIM SHEET ──────── */
+function lsTab2Html(ls, ref) {
+  const lat = computeLoadAndTrim(ls, ref);
+  const dev = ls.loadAndTrim.weightDeviation;
+  return `
+    <section class="card">
+      <h3 class="card-h">Dry operating weight conditions</h3>
+      <div class="ls-dow-box">
+        <div class="ls-dow-inputs">
+          <label>DOW H-arm (cm)<input type="number" data-lsf="loadAndTrim.dryOperatingWeightHArm" value="${ls.loadAndTrim.dryOperatingWeightHArm}"/></label>
+          <span class="mono ls-dow-static">Weight: ${lsKg(computeWeightTotals(ls).dryOperatingWeight)}</span>
+        </div>
+        <div class="ls-formula mono">I = ((H-arm − ${ref.indexConstant}) × W / 2500) + 100</div>
+        <div class="ls-dow-result" id="lt-dow-index">Dry Operating Weight Index = <strong>${lat.dryOperatingWeightIndex}</strong></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3 class="card-h">Weight deviation &amp; basic index correction</h3>
+      <div class="ls-dev-flow">
+        <table class="cmp-tbl ls-dev-tbl">
+          <thead><tr><th></th>${['E', 'F', 'G', 'H'].map(z => `<th>${z}</th>`).join('')}</tr></thead>
+          <tbody>
+            <tr><td>Deviation (kg)</td>${['E', 'F', 'G', 'H'].map(z => `<td><input type="number" class="mono ls-dev-input" data-lsf="loadAndTrim.weightDeviation.${z}" value="${dev[z]}"/></td>`).join('')}</tr>
+            <tr><td>Corr. @ +100kg</td>${['E', 'F', 'G', 'H'].map(z => `<td class="mono">${ref.basicIndexCorrection.plus100[z]}</td>`).join('')}</tr>
+            <tr><td>Corr. @ −100kg</td>${['E', 'F', 'G', 'H'].map(z => `<td class="mono">${ref.basicIndexCorrection.minus100[z]}</td>`).join('')}</tr>
+          </tbody>
+        </table>
+        <span class="ls-dev-arrow">→</span>
+        <div class="ls-corrected-box" id="lt-corrected">Corrected Index<br/><strong>${lat.correctedIndex}</strong></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3 class="card-h">Aircraft schematic</h3>
+      <div id="lt-schematic">${lsSchematicSVG(ref, lat)}</div>
+    </section>
+
+    <section class="card">
+      <h3 class="card-h">Zones / index table</h3>
+      <div id="lt-zones-table">${lsZonesTableHtml(lat)}</div>
+    </section>
+
+    <section class="card">
+      <h3 class="card-h">Fuel index &amp; index summary</h3>
+      <div id="lt-summary-strip">${lsSummaryStripHtml(ls, lat)}</div>
+    </section>
+
+    <div class="ls-cg-grid">
+      <section class="card">
+        <h3 class="card-h">CG envelope chart</h3>
+        <div id="lt-chart">${lsEnvelopeChartSVG(ref, lat, computeWeightTotals(ls))}</div>
+        <p class="an-cap mono">dashed = take-off limit · solid = ZFW limit</p>
+      </section>
+      <section class="card">
+        <div id="lt-cg-readouts">${lsCgReadoutsHtml(lat)}</div>
+        <h3 class="card-h" style="margin-top:16px">Pitch trim</h3>
+        <div id="lt-trim">${lsTrimBlockHtml(lat)}</div>
+      </section>
+    </div>`;
+}
+
+function lsZonesTableHtml(lat) {
+  return `<table class="cmp-tbl">
+    <thead><tr><th>Zone</th><th>Kind</th><th>Nbr</th><th>Weight (kg)</th><th>Index</th></tr></thead>
+    <tbody>${lat.zones.map(z => `<tr><td>${escapeHtml(z.label)}</td><td>${z.kind}</td><td class="mono">${z.paxCount != null ? z.paxCount : '—'}</td><td class="mono">${Math.round(z.weightKg)}</td><td class="mono">${z.indexUnit}</td></tr>`).join('')}</tbody>
+  </table>`;
+}
+
+function lsSummaryStripHtml(ls, lat) {
+  return `
+    <div class="kpi-strip ls-summary-strip">
+      <div class="kpi"><span class="kpi-num mono">${lat.fuelIndex}</span><span class="kpi-lbl">Fuel Index</span></div>
+      <div class="kpi"><span class="kpi-num mono">${lat.deadLoadIndex}</span><span class="kpi-lbl">Dead Load Index</span></div>
+      <div class="kpi"><span class="kpi-num mono">${lat.loadedIndexZFW}</span><span class="kpi-lbl">Loaded Index ZFW</span></div>
+      <div class="kpi"><span class="kpi-num mono">${lat.loadedIndexTOW}</span><span class="kpi-lbl">Loaded Index TOW</span></div>
+    </div>`;
+}
+
+function lsCgReadoutsHtml(lat) {
+  return `
+    <h3 class="card-h">Takeoff CG %MAC</h3>
+    <div class="ls-cg-big ${lat.towInEnvelope ? '' : 'bad'}">${lat.cgPercentMacTakeoff}%</div>
+    <div class="ls-cdu-box ${lat.zfwInEnvelope ? '' : 'bad'}">
+      <div class="ls-cdu-title">ZFW CDU Input</div>
+      <div class="ls-cdu-row"><span>Weight</span><span class="mono">${(lat._zfwK || 0)}</span></div>
+      <div class="ls-cdu-row"><span>CG %MAC</span><span class="mono">${lat.cgPercentMacZFW}%</span></div>
+    </div>`;
+}
+
+function lsTrimBlockHtml(lat) {
+  const dirLabel = lat.pitchTrimDirection === 'CONSTANT' ? 'CONSTANT' : `${lat.pitchTrimDegrees}° ${lat.pitchTrimDirection}`;
+  return `${lsTrimGaugeSVG(lat)}<div class="ls-trim-readout mono">${dirLabel}</div>`;
+}
+
+function lsSchematicSVG(ref, lat) {
+  const W = 640, H = 190;
+  const cabin = lat.zones.filter(z => z.kind === 'CABIN');
+  const cargo = lat.zones.filter(z => z.kind === 'CARGO');
+  const fuseX = 40, fuseW = W - 80, fuseY = 30, fuseH = 60;
+  const cabinW = fuseW / Math.max(1, cabin.length);
+  const cargoY = fuseY + fuseH + 30, cargoH = 40;
+  const cargoW = fuseW / Math.max(1, cargo.length);
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="ls-schematic-svg">
+    <path d="M${fuseX} ${fuseY} h${fuseW} a15 15 0 0 1 0 ${fuseH} h-${fuseW} a15 15 0 0 1 0 -${fuseH} Z" class="ls-fuse"/>
+    ${cabin.map((z, i) => {
+    const x = fuseX + i * cabinW; const rz = ref.cabinZones[i] || {};
+    return `<g class="ls-cabin-zone">
+        <rect x="${x.toFixed(1)}" y="${fuseY}" width="${cabinW.toFixed(1)}" height="${fuseH}" class="ls-cabin-rect"/>
+        <text x="${(x + cabinW / 2).toFixed(1)}" y="${fuseY + 20}" text-anchor="middle" class="ls-zone-code">${escapeHtml(z.code)}</text>
+        <text x="${(x + cabinW / 2).toFixed(1)}" y="${fuseY + 36}" text-anchor="middle" class="ls-zone-sub mono">${z.paxCount} pax · rows ${escapeHtml(rz.rowRange || '')}</text>
+        <text x="${(x + cabinW / 2).toFixed(1)}" y="${fuseY + 50}" text-anchor="middle" class="ls-zone-sub mono">${Math.round(z.weightKg)} kg</text>
+      </g>`;
+  }).join('')}
+    ${cargo.map((z, i) => {
+    const x = fuseX + i * cargoW;
+    return `<g class="ls-cargo-zone">
+        <rect x="${x.toFixed(1)}" y="${cargoY}" width="${cargoW.toFixed(1)}" height="${cargoH}" rx="4" class="ls-cargo-rect"/>
+        <text x="${(x + cargoW / 2).toFixed(1)}" y="${cargoY + 16}" text-anchor="middle" class="ls-zone-code">${escapeHtml(z.label)}</text>
+        <text x="${(x + cargoW / 2).toFixed(1)}" y="${cargoY + 31}" text-anchor="middle" class="ls-zone-sub mono">${Math.round(z.weightKg)}/${z.capacityKg} kg</text>
+      </g>`;
+  }).join('')}
+  </svg>`;
+}
+
+function lsEnvelopeChartSVG(ref, lat, wt) {
+  const W = 400, H = 300, padL = 50, padR = 16, padT = 14, padB = 30;
+  const macLo = 8, macHi = 40, wLo = 0, wHi = ref.mtow * 1.05;
+  const sx = mac => padL + (mac - macLo) / (macHi - macLo) * (W - padL - padR);
+  const sy = w => (H - padB) - (w - wLo) / (wHi - wLo) * (H - padT - padB);
+  const envPts = ref.envelope.map(p => [sx(p.mac), sy(p.weightKg)]);
+  const refLines = [{ w: ref.mzfw, label: 'MZFW' }, { w: ref.mlw, label: 'MLW' }, { w: ref.mtow, label: 'MTOW' }];
+  const zfwPt = [sx(lat.cgPercentMacZFW), sy(wt.zeroFuelWeight)];
+  const towPt = [sx(lat.cgPercentMacTakeoff), sy(wt.takeoffWeight)];
+  const bad = !lat.zfwInEnvelope || !lat.towInEnvelope;
+  const traceLen = Math.max(1, Math.hypot(towPt[0] - zfwPt[0], towPt[1] - zfwPt[1])).toFixed(1);
+  lat._zfwK = (wt.zeroFuelWeight / 1000).toFixed(1);
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="ls-cg-svg">
+    <polygon points="${envPts.map(p => p.join(',')).join(' ')}" class="ls-env-fill"/>
+    <polyline points="${envPts.slice(0, 3).map(p => p.join(',')).join(' ')}" class="ls-env-line ls-env-dashed"/>
+    <polyline points="${envPts.slice(3, 6).map(p => p.join(',')).join(' ')}" class="ls-env-line ls-env-solid"/>
+    ${refLines.map(r => `<line x1="${padL}" y1="${sy(r.w).toFixed(1)}" x2="${W - padR}" y2="${sy(r.w).toFixed(1)}" class="ls-ref-line"/><text x="${W - padR}" y="${(sy(r.w) - 3).toFixed(1)}" text-anchor="end" class="ls-axis-lbl mono">${r.label} ${(r.w / 1000).toFixed(0)}k</text>`).join('')}
+    <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${H - padB}" class="ls-axis"/>
+    <line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" class="ls-axis"/>
+    <text x="${((padL + W - padR) / 2).toFixed(1)}" y="${H - 6}" text-anchor="middle" class="ls-axis-lbl mono">Aircraft CG (%MAC)</text>
+    <path d="M${zfwPt[0].toFixed(1)} ${zfwPt[1].toFixed(1)} L${towPt[0].toFixed(1)} ${towPt[1].toFixed(1)}" class="ls-trace ${bad ? 'bad' : ''}" stroke-dasharray="${traceLen}" stroke-dashoffset="${traceLen}"/>
+    <circle cx="${zfwPt[0].toFixed(1)}" cy="${zfwPt[1].toFixed(1)}" r="4" class="ls-trace-pt ${lat.zfwInEnvelope ? '' : 'bad'}"/>
+    <circle cx="${towPt[0].toFixed(1)}" cy="${towPt[1].toFixed(1)}" r="4" class="ls-trace-pt ${lat.towInEnvelope ? '' : 'bad'}"/>
+    <text x="${zfwPt[0].toFixed(1)}" y="${(zfwPt[1] - 8).toFixed(1)}" text-anchor="middle" class="ls-trace-lbl mono ${lat.zfwInEnvelope ? '' : 'bad'}">ZFW ${lat.cgPercentMacZFW}%</text>
+    <text x="${towPt[0].toFixed(1)}" y="${(towPt[1] - 8).toFixed(1)}" text-anchor="middle" class="ls-trace-lbl mono ${lat.towInEnvelope ? '' : 'bad'}">TOW ${lat.cgPercentMacTakeoff}%</text>
+  </svg>`;
+}
+
+function lsTrimGaugeSVG(lat) {
+  const W = 300, H = 60, lo = -6, hi = 6;
+  const signedDeg = lat.pitchTrimDirection === 'DOWN' ? -lat.pitchTrimDegrees : lat.pitchTrimDegrees;
+  const clamped = Math.max(lo, Math.min(hi, signedDeg));
+  const x = 20 + (clamped - lo) / (hi - lo) * (W - 40);
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" class="ls-trim-svg">
+    <line x1="20" y1="30" x2="${W - 20}" y2="30" class="ls-trim-track"/>
+    <text x="20" y="48" class="ls-trim-tick mono">NOSE DOWN</text>
+    <text x="${W / 2}" y="48" text-anchor="middle" class="ls-trim-tick mono">CONSTANT</text>
+    <text x="${W - 20}" y="48" text-anchor="end" class="ls-trim-tick mono">NOSE UP</text>
+    <circle cx="${x.toFixed(1)}" cy="30" r="7" class="ls-trim-marker"/>
+  </svg>`;
+}
+
+function lsSetDeep(obj, path, value) {
+  const parts = path.split('.');
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) { const k = /^\d+$/.test(parts[i]) ? Number(parts[i]) : parts[i]; cur = cur[k]; }
+  const last = parts[parts.length - 1]; const lastKey = /^\d+$/.test(last) ? Number(last) : last;
+  cur[lastKey] = value;
+}
+
+/* apply an approved loadsheet's confirmed passenger count to the flight's
+   risk-engine inputs — same recalc + fresh-alert pattern as recalcSequence,
+   scoped to just this one flight rather than the whole active fleet */
+function applyLoadsheetToFlight(ls, wt) {
+  const flight = getFlight(ls.flightId);
+  if (!flight) return null;
+  const seating = (AIRCRAFT_SPECS[flight.aircraftType] || {}).seating;
+  const pct = seating ? +((wt.totalPassengers / seating) * 100).toFixed(1) : flight.rawInputs.loadFactorPercent;
+  const old = { risk: flight.calculation.riskLevel, buffer: flight.calculation.bufferMinutes };
+  flight.rawInputs.loadFactorPercent = pct;
+  flight.rawInputs.passengerTotal = wt.totalPassengers;
+  const p = flight.inputProvenance.perVariable.loadFactorPercent;
+  p.quality = 'MEASURED'; p.source = `Loadsheet ${ls.flightNumber}`; p.timestamp = nowISO(); delete p._autoD;
+  flight.calculation = calculateFlightRisk(flight);
+  updateFlight(flight.id, { rawInputs: flight.rawInputs, inputProvenance: flight.inputProvenance, calculation: flight.calculation });
+  if (flight.calculation.riskLevel === 'RED' && old.risk !== 'RED') {
+    const alerts = getAlerts(); const al = makeAlertRecord(flight); al.createdAt = nowISO();
+    flight.alertId = al.id; flight.ackStatus = 'REQUIRED'; flight.ackAt = null; flight.ackBy = null;
+    alerts.push(al); saveAlerts(alerts);
+    updateFlight(flight.id, { alertId: flight.alertId, ackStatus: flight.ackStatus, ackAt: flight.ackAt, ackBy: flight.ackBy });
+  }
+  return { old, next: { risk: flight.calculation.riskLevel, buffer: flight.calculation.bufferMinutes }, loadFactorPercent: pct };
+}
+
+function wireLoadsheet(el, ls, ref, lsAll, f) {
+  function repaint() {
+    const wt = computeWeightTotals(ls);
+    const lat = computeLoadAndTrim(ls, ref);
+    const validation = lsValidate(ls, ref);
+    saveLoadsheets(lsAll);
+
+    const set = (id, html) => { const n = el.querySelector('#' + id); if (n) n.textContent = html; };
+    set('ls-dow', lsKg(wt.dryOperatingWeight));
+    set('ls-ow', lsKg(wt.operatingWeight));
+    set('ls-ow2', lsKg(wt.operatingWeight));
+    set('ls-of-fuel', lsKg(ls.weightBuildup.takeoffFuel));
+    set('ls-awt', lsKg(wt.allowedWeightForTakeoff));
+    set('ls-atl', lsKg(wt.allowedTrafficLoad));
+    const bindEl = el.querySelector('#ls-awt-bind'); if (bindEl) { bindEl.textContent = `(${wt.binding})`; bindEl.title = wt.bindingLabel; }
+
+    ls.destinations.forEach((d, i) => {
+      const paxTotal = (Number(d.pax.male) || 0) + (Number(d.pax.female) || 0) + (Number(d.pax.child) || 0) + (Number(d.pax.infant) || 0);
+      const rowTotal = (Number(d.rows.tr) || 0) + (Number(d.rows.b) || 0) + (Number(d.rows.c) || 0) + (Number(d.rows.m) || 0);
+      set(`ls-dpax-${i}`, paxTotal); set(`ls-dtot-${i}`, lsKg(rowTotal));
+    });
+
+    const ledger = el.querySelector('#ls-totals-ledger'); if (ledger) ledger.innerHTML = lsTotalsLedgerHtml(ls, wt);
+    const lmcTotalEl = el.querySelector('#ls-lmc-total'); if (lmcTotalEl) lmcTotalEl.textContent = fmtSigned(lsSum((ls.lastMinuteChanges || []).map(x => x.weightDelta))) + ' kg';
+    const balBox = el.querySelector('#ls-balance-box'); if (balBox) balBox.innerHTML = lsBalanceBoxHtml(ls, ref, wt);
+
+    const valEl = el.querySelector('#ls-validation');
+    if (valEl) { valEl.className = 'ls-validation ' + (validation.ok ? 'ok' : 'bad'); valEl.textContent = validation.ok ? '✓ All safety checks passed — approvable.' : `VALIDATION_FAILED · ${validation.issues.length} issue${validation.issues.length > 1 ? 's' : ''}`; }
+    const issuesEl = el.querySelector('#ls-issues');
+    if (issuesEl) { issuesEl.hidden = validation.ok; issuesEl.innerHTML = validation.issues.map(i => `<li>${escapeHtml(i)}</li>`).join(''); }
+    const approveBtn = el.querySelector('#ls-approve-btn'); if (approveBtn) approveBtn.disabled = !validation.ok;
+
+    const dowIdxEl = el.querySelector('#lt-dow-index'); if (dowIdxEl) dowIdxEl.innerHTML = `Dry Operating Weight Index = <strong>${lat.dryOperatingWeightIndex}</strong>`;
+    const dowStatic = el.querySelector('.ls-dow-static'); if (dowStatic) dowStatic.textContent = `Weight: ${lsKg(wt.dryOperatingWeight)}`;
+    const corrBox = el.querySelector('#lt-corrected'); if (corrBox) corrBox.innerHTML = `Corrected Index<br/><strong>${lat.correctedIndex}</strong>`;
+    const schem = el.querySelector('#lt-schematic'); if (schem) schem.innerHTML = lsSchematicSVG(ref, lat);
+    const zt = el.querySelector('#lt-zones-table'); if (zt) zt.innerHTML = lsZonesTableHtml(lat);
+    const sstrip = el.querySelector('#lt-summary-strip'); if (sstrip) sstrip.innerHTML = lsSummaryStripHtml(ls, lat);
+    const trim = el.querySelector('#lt-trim'); if (trim) trim.innerHTML = lsTrimBlockHtml(lat);
+    const chart = el.querySelector('#lt-chart');
+    if (chart) { chart.innerHTML = lsEnvelopeChartSVG(ref, lat, wt); animateLsTrace(chart); }
+    /* lsEnvelopeChartSVG sets lat._zfwK (the ZFW CDU readout) as a side
+       effect, so the CG readouts must be painted after the chart above */
+    const cgReadouts = el.querySelector('#lt-cg-readouts'); if (cgReadouts) cgReadouts.innerHTML = lsCgReadoutsHtml(lat);
+  }
+
+  function animateLsTrace(scope) {
+    const trace = (scope || el).querySelector('.ls-trace');
+    if (!trace) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { trace.style.strokeDashoffset = '0'; return; }
+    requestAnimationFrame(() => { trace.style.transition = 'stroke-dashoffset 1.1s var(--ease)'; trace.style.strokeDashoffset = '0'; });
+  }
+  animateLsTrace(el);
+
+  el.querySelector('#ls-flight-select').onchange = e => { loadsheetSelectedFlightId = e.target.value; showModule('loadsheet'); };
+  el.querySelectorAll('.ls-tab-btn').forEach(btn => btn.onclick = () => {
+    loadsheetTab = btn.dataset.lstab;
+    el.querySelectorAll('.ls-tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+    el.querySelector('#ls-pane-ls').hidden = loadsheetTab !== 'ls';
+    el.querySelector('#ls-pane-lt').hidden = loadsheetTab !== 'lt';
+  });
+
+  el.addEventListener('input', e => {
+    const t = e.target; if (!t.dataset.lsf) return;
+    const value = t.type === 'number' ? (Number(t.value) || 0) : t.value;
+    lsSetDeep(ls, t.dataset.lsf, value);
+    repaint();
+  });
+  el.addEventListener('change', e => {
+    const t = e.target; if (t.tagName !== 'SELECT' || !t.dataset.lsf) return;
+    lsSetDeep(ls, t.dataset.lsf, t.value); repaint();
+  });
+
+  const addDestBtn = el.querySelector('#ls-add-dest');
+  if (addDestBtn) addDestBtn.onclick = () => {
+    ls.destinations.push({ dest: '', pax: { male: 0, female: 0, child: 0, infant: 0 }, cabBag: 0, distributionWeights: [0, 0, 0, 0, 0, 0], rows: { tr: 0, b: 0, c: 0, m: 0 }, remarks: { pax: 'Y', pad: 'N' } });
+    saveLoadsheets(lsAll); showModule('loadsheet');
+  };
+  el.querySelectorAll('[data-remove-dest]').forEach(btn => btn.onclick = () => {
+    ls.destinations.splice(Number(btn.dataset.removeDest), 1); saveLoadsheets(lsAll); showModule('loadsheet');
+  });
+
+  const lmcAddBtn = el.querySelector('#ls-lmc-add-btn');
+  if (lmcAddBtn) lmcAddBtn.onclick = () => {
+    const dest = el.querySelector('#ls-lmc-dest').value.trim();
+    const spec = el.querySelector('#ls-lmc-spec').value.trim();
+    const comp = el.querySelector('#ls-lmc-comp').value.trim();
+    const wtd = Number(el.querySelector('#ls-lmc-wt').value);
+    if (!spec || !wtd) { showToast('Enter a specification and a non-zero weight change', 'error'); return; }
+    const session = getSession();
+    ls.lastMinuteChanges.push({ dest, specification: spec, compartment: comp, weightDelta: wtd, enteredBy: session ? session.name : 'System', enteredAt: nowISO() });
+    if (ls.status === 'APPROVED') ls.status = 'SUPERSEDED_BY_LMC';
+    saveLoadsheets(lsAll);
+    logActivity({ action: `added LMC (${fmtSigned(wtd)} kg)`, target: ls.flightNumber, category: 'loadsheet', severity: 'warn' });
+    showToast(`LMC added to ${ls.flightNumber}${ls.status === 'SUPERSEDED_BY_LMC' ? ' — now requires re-approval' : ''}`, 'notice');
+    showModule('loadsheet');
+  };
+
+  const prepareBtn = el.querySelector('#ls-prepare-btn');
+  if (prepareBtn) prepareBtn.onclick = () => {
+    const session = getSession();
+    ls.status = 'PREPARED'; ls.preparedBy = session ? session.name : 'System'; ls.preparedByUserId = session ? session.userId : null; ls.preparedAt = nowISO();
+    if (!ls.initials && session) ls.initials = session.name.split(' ').map(n => n[0]).join('').toUpperCase();
+    saveLoadsheets(lsAll);
+    logActivity({ action: 'marked loadsheet as prepared', target: ls.flightNumber, category: 'loadsheet', severity: 'info' });
+    showToast(`Loadsheet for ${ls.flightNumber} prepared and locked`, 'success');
+    showModule('loadsheet');
+  };
+
+  const unlockBtn = el.querySelector('#ls-unlock-btn');
+  if (unlockBtn) unlockBtn.onclick = async () => {
+    const ok = await confirmDialog({ title: 'Unlock loadsheet?', message: `Revert the loadsheet for ${ls.flightNumber} back to Draft? It will need to be re-prepared before it can be approved.`, confirmLabel: 'Unlock', danger: false });
+    if (!ok) return;
+    ls.status = 'DRAFT'; ls.preparedBy = null; ls.preparedByUserId = null; ls.preparedAt = null;
+    saveLoadsheets(lsAll);
+    logActivity({ action: 'unlocked loadsheet to Draft', target: ls.flightNumber, category: 'loadsheet', severity: 'info' });
+    showToast(`Loadsheet for ${ls.flightNumber} unlocked`, 'notice');
+    showModule('loadsheet');
+  };
+
+  const approveBtn = el.querySelector('#ls-approve-btn');
+  if (approveBtn) approveBtn.onclick = async () => {
+    const validation = lsValidate(ls, ref);
+    if (!validation.ok) { showToast('Cannot approve — validation issues remain', 'error'); return; }
+    const session = getSession();
+    if (session && ls.preparedByUserId && ls.preparedByUserId === session.userId) { showToast('Approval requires a different user than the preparer', 'error'); return; }
+    const ok = await confirmDialog({ title: `${ls.status === 'SUPERSEDED_BY_LMC' ? 'Re-approve' : 'Approve'} loadsheet?`, message: `Confirm the load figures for ${ls.flightNumber}? This updates the flight's risk-engine load factor input.`, confirmLabel: ls.status === 'SUPERSEDED_BY_LMC' ? 'Re-approve' : 'Approve', danger: false });
+    if (!ok) return;
+    ls.status = 'APPROVED'; ls.approvedBy = session ? session.name : 'System'; ls.approvedByUserId = session ? session.userId : null; ls.approvedAt = nowISO();
+    saveLoadsheets(lsAll);
+    logActivity({ action: 'approved loadsheet', target: ls.flightNumber, category: 'loadsheet', severity: 'success' });
+    const wt = computeWeightTotals(ls);
+    const hook = applyLoadsheetToFlight(ls, wt);
+    showToast(`Loadsheet approved for ${ls.flightNumber}${hook ? ` · load factor confirmed at ${hook.loadFactorPercent}%` : ''}`, 'success');
+    showModule('loadsheet');
+  };
+}
+
+/* ── seed 5 loadsheets across DRAFT / PREPARED (valid + invalid) /
+   APPROVED / SUPERSEDED_BY_LMC, matching the "real data to demonstrate the
+   re-approval flow" requirement — every computed field below is produced
+   by the pure calc functions above, not hand-typed */
+function seedLoadsheets() {
+  if (getLoadsheets().length) return;
+  const flights = getFlights(); if (!flights.length) return;
+  const now = Date.now(); const iso = ms => new Date(ms).toISOString(); const ago = h => iso(now - h * 3600000);
+  const byNum = num => flights.find(f => f.flightNumber === num);
+
+  function base(f, over) {
+    const ref = lsRefFor(f.aircraftType);
+    return Object.assign(buildFreshLoadsheet(f), over);
+  }
+
+  const seeds = [];
+
+  /* PK-301 · Airbus A320 · DRAFT */
+  const pk301 = byNum('PK-301');
+  if (pk301) seeds.push(base(pk301, {
+    acReg: 'AP-301', crew: '2 / 4', to: 'LHE', originator: '', initials: '', priorityAddresses: 'MUXOPXH',
+    weightBuildup: { basicWeight: 42000, crewWeight: 600, pantryWeight: 700, takeoffFuel: 8000, tripFuel: 6000, maxZeroFuelWeight: 62500, maxTakeoffWeight: 78000, maxLandingWeight: 66000 },
+    destinations: [{ dest: 'LHE', pax: { male: 55, female: 45, child: 15, infant: 5 }, cabBag: 250, distributionWeights: [300, 250, 200, 0, 0, 0], rows: { tr: 100, b: 650, c: 200, m: 50 }, remarks: { pax: 'Y', pad: 'N' } }],
+    notes: 'Standard load, no special handling.',
+    loadAndTrim: { dryOperatingWeightHArm: 1000.0, weightDeviation: { E: 0, F: 0, G: 0, H: 0 } }
+  }));
+
+  /* PA-204 · Boeing 777-200ER · PREPARED — deliberately overloaded, demonstrates the blocking validation */
+  const pa204 = byNum('PA-204');
+  if (pa204) seeds.push(base(pa204, {
+    acReg: 'A6-204', crew: '2 / 6', to: 'JED', originator: 'Bilal Ahmed', initials: 'BA', priorityAddresses: 'MUXOPXH JEDOPXH',
+    status: 'PREPARED', preparedBy: 'Bilal Ahmed', preparedByUserId: null, preparedAt: ago(3),
+    weightBuildup: { basicWeight: 138000, crewWeight: 1200, pantryWeight: 3000, takeoffFuel: 45000, tripFuel: 38000, maxZeroFuelWeight: 195000, maxTakeoffWeight: 297500, maxLandingWeight: 213000 },
+    destinations: [{ dest: 'JED', pax: { male: 140, female: 110, child: 20, infant: 10 }, cabBag: 2000, distributionWeights: [8500, 7500, 7500, 6500, 0, 0], rows: { tr: 2000, b: 20000, c: 8000, m: 2000 }, remarks: { pax: 'Y', pad: 'Y' } }],
+    notes: 'Overweight — awaiting load reduction before this can be approved.',
+    loadAndTrim: { dryOperatingWeightHArm: 1000.0, weightDeviation: { E: 0, F: 0, G: 0, H: 0 } }
+  }));
+
+  /* PK-305 · Boeing 747-400 (Hajj Peak) · APPROVED — clean, risk-engine hook applied */
+  const pk305 = byNum('PK-305');
+  if (pk305) seeds.push(base(pk305, {
+    acReg: 'AP-305', crew: '3 / 8', to: 'JED', originator: 'Sana Malik', initials: 'SM', priorityAddresses: 'MUXOPXH JEDOPXH',
+    status: 'APPROVED', preparedBy: 'Ayesha Raza', preparedByUserId: null, preparedAt: ago(6),
+    approvedBy: 'Sana Malik', approvedByUserId: null, approvedAt: ago(5),
+    weightBuildup: { basicWeight: 180000, crewWeight: 1800, pantryWeight: 4500, takeoffFuel: 60000, tripFuel: 50000, maxZeroFuelWeight: 242000, maxTakeoffWeight: 396890, maxLandingWeight: 285760 },
+    destinations: [{ dest: 'JED', pax: { male: 150, female: 130, child: 70, infant: 20 }, cabBag: 2500, distributionWeights: [4000, 3800, 3600, 3400, 3000, 0], rows: { tr: 2300, b: 12000, c: 5000, m: 1000 }, remarks: { pax: 'Y', pad: 'N' } }],
+    notes: 'Hajj charter — full catering config.',
+    loadAndTrim: { dryOperatingWeightHArm: 1000.0, weightDeviation: { E: 50, F: -30, G: 20, H: 80 } }
+  }));
+
+  /* 9P-220 · Airbus A321 · SUPERSEDED_BY_LMC — approved, then a late LMC pushed it over allowed traffic load by 50kg */
+  const p220 = byNum('9P-220');
+  if (p220) seeds.push(base(p220, {
+    acReg: '9P-220', crew: '2 / 5', to: 'DXB', originator: 'Ayesha Raza', initials: 'AR', priorityAddresses: 'MUXOPXH DXBOPXH',
+    status: 'SUPERSEDED_BY_LMC', preparedBy: 'Ayesha Raza', preparedByUserId: null, preparedAt: ago(4),
+    approvedBy: 'Sana Malik', approvedByUserId: null, approvedAt: ago(3),
+    weightBuildup: { basicWeight: 45500, crewWeight: 700, pantryWeight: 800, takeoffFuel: 9500, tripFuel: 7200, maxZeroFuelWeight: 68000, maxTakeoffWeight: 89000, maxLandingWeight: 77800 },
+    destinations: [{ dest: 'DXB', pax: { male: 90, female: 80, child: 30, infant: 10 }, cabBag: 800, distributionWeights: [1200, 1100, 900, 0, 0, 0], rows: { tr: 400, b: 2800, c: 700, m: 100 }, remarks: { pax: 'Y', pad: 'N' } }],
+    notes: 'Late cargo tender received after approval — see LMC.',
+    lastMinuteChanges: [{ dest: 'DXB', specification: 'Late cargo tender — engine part', compartment: '2', weightDelta: 150, enteredBy: 'Bilal Ahmed', enteredAt: ago(1) }],
+    loadAndTrim: { dryOperatingWeightHArm: 1000.0, weightDeviation: { E: 0, F: 0, G: 40, H: 60 } }
+  }));
+
+  /* ER-540 · Airbus A330-300 · PREPARED — clean, awaiting approval */
+  const er540 = byNum('ER-540');
+  if (er540) seeds.push(base(er540, {
+    acReg: 'ER-540', crew: '2 / 6', to: 'DXB', originator: 'Ayesha Raza', initials: 'AR', priorityAddresses: 'MUXOPXH DXBOPXH',
+    status: 'PREPARED', preparedBy: 'Ayesha Raza', preparedByUserId: null, preparedAt: ago(2),
+    weightBuildup: { basicWeight: 122000, crewWeight: 1100, pantryWeight: 2600, takeoffFuel: 38000, tripFuel: 31000, maxZeroFuelWeight: 170000, maxTakeoffWeight: 242000, maxLandingWeight: 187000 },
+    destinations: [{ dest: 'DXB', pax: { male: 120, female: 100, child: 50, infant: 10 }, cabBag: 1000, distributionWeights: [3000, 2800, 2600, 2400, 0, 0], rows: { tr: 1000, b: 8000, c: 2300, m: 500 }, remarks: { pax: 'Y', pad: 'N' } }],
+    notes: 'Standard load, awaiting supervisor approval.',
+    loadAndTrim: { dryOperatingWeightHArm: 1000.0, weightDeviation: { E: 20, F: 0, G: 0, H: 0 } }
+  }));
+
+  saveLoadsheets(seeds);
+
+  /* the two sheets that reached APPROVED historically (PK-305, and 9P-220
+     before its LMC) already fed the risk engine at the time — apply that
+     same hook now so the seed data is internally consistent on first load */
+  [pk305, p220].filter(Boolean).forEach(f => {
+    const rec = seeds.find(s => s.flightId === f.id);
+    if (rec) applyLoadsheetToFlight(rec, computeWeightTotals(rec));
+  });
+}
 
 document.addEventListener('DOMContentLoaded', init);
