@@ -152,8 +152,29 @@ function seedIfEmpty() {
       name: 'Hina Shah', email: 'hina.shah@piac.com.pk', password: 'Reqst@2024', role: 'AIRLINE_REP',
       organisation: 'PIA', status: 'REJECTED', registeredAt: iso(now - 864e5 * 2),
       decidedAt: iso(now - 864e5), decidedBy: 'System Admin', rejectionReason: 'Organisation affiliation could not be verified.'
+    }),
+    mk({
+      id: 'seed-guest', name: 'Guest Viewer', email: 'demo.viewer@orbis.local', password: 'Guest@View2026', role: 'AIRLINE_REP',
+      organisation: 'ORBIS Demo', status: 'APPROVED', permissions: ['flightboard', 'turnaround', 'manager', 'analytics'],
+      decidedAt: iso(now), decidedBy: 'System'
     })
   ];
+  saveUsers(users);
+}
+
+/* a browser whose localStorage was seeded before the guest/demo viewer
+   account existed won't pick it up from seedIfEmpty (users already present) —
+   backfill it so temp access can be handed out without clearing storage */
+function seedGuestUser() {
+  const users = getUsers();
+  if (!users.length || users.some(u => u.id === 'seed-guest')) return;
+  const now = Date.now();
+  users.push({
+    id: 'seed-guest', name: 'Guest Viewer', email: 'demo.viewer@orbis.local', password: 'Guest@View2026', role: 'AIRLINE_REP',
+    organisation: 'ORBIS Demo', permissions: ['flightboard', 'turnaround', 'manager', 'analytics'],
+    registeredAt: new Date(now).toISOString(), decidedAt: new Date(now).toISOString(), decidedBy: 'System',
+    status: 'APPROVED', rejectionReason: null, sessionActive: false, lastActiveAt: null
+  });
   saveUsers(users);
 }
 
@@ -1402,6 +1423,7 @@ function wireApp() { document.getElementById('app-signout').addEventListener('cl
 
 function init() {
   seedIfEmpty();
+  seedGuestUser();
   migratePermissions();
   seedOpsData();
   seedLoadsheets();
