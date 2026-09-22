@@ -155,7 +155,7 @@ function seedIfEmpty() {
     }),
     mk({
       id: 'seed-guest', name: 'Guest Viewer', email: 'demo.viewer@orbis.local', password: 'Guest@View2026', role: 'AIRLINE_REP',
-      organisation: 'ORBIS Demo', status: 'APPROVED', permissions: ['flightboard', 'turnaround', 'manager', 'analytics'],
+      organisation: 'ORBIS Demo', status: 'APPROVED', permissions: [...ALL_MODULES],
       decidedAt: iso(now), decidedBy: 'System'
     })
   ];
@@ -167,11 +167,19 @@ function seedIfEmpty() {
    backfill it so temp access can be handed out without clearing storage */
 function seedGuestUser() {
   const users = getUsers();
-  if (!users.length || users.some(u => u.id === 'seed-guest')) return;
+  if (!users.length) return;
+  const existing = users.find(u => u.id === 'seed-guest');
+  if (existing) {
+    if (!ALL_MODULES.every(m => existing.permissions && existing.permissions.includes(m))) {
+      existing.permissions = [...ALL_MODULES];
+      saveUsers(users);
+    }
+    return;
+  }
   const now = Date.now();
   users.push({
     id: 'seed-guest', name: 'Guest Viewer', email: 'demo.viewer@orbis.local', password: 'Guest@View2026', role: 'AIRLINE_REP',
-    organisation: 'ORBIS Demo', permissions: ['flightboard', 'turnaround', 'manager', 'analytics'],
+    organisation: 'ORBIS Demo', permissions: [...ALL_MODULES],
     registeredAt: new Date(now).toISOString(), decidedAt: new Date(now).toISOString(), decidedBy: 'System',
     status: 'APPROVED', rejectionReason: null, sessionActive: false, lastActiveAt: null
   });
